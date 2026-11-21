@@ -23,7 +23,7 @@ printf 'FILE "TEST.BIN" BINARY\n  TRACK 01 MODE1/2352\n    INDEX 01 00:00:00\n  
 head -c 131072 /dev/zero > images/GAME2.ISO
 printf 'FILE "NONE.BIN" BINARY\n  TRACK 01 AUDIO\n    INDEX 01 00:00:00\n' > images/BROKEN.CUE
 run() {
-  "$PIX68K" -r "$ROM_DIR" --cpu 68030 --ipl "$IPL30" --image-dir images --cd images/TEST.CUE --no-sram --no-wait \
+  "$PIX68K" --no-config -r "$ROM_DIR" --cpu 68030 --ipl "$IPL30" --image-dir images --cd images/TEST.CUE --no-sram --no-wait \
     --frames "$1" --press-after 60 --press "$2" > out.txt 2>&1 || { cat out.txt; echo "NG: pix68k failed"; exit 1; }
   cat out.txt
 }

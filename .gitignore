@@ -2,3 +2,4 @@ build/
 __pycache__/
 *.uf2
 *.bin
+build-win/

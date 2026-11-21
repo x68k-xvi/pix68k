@@ -1,5 +1,21 @@
 #include "host_serial.h"
 
+#include <string.h>
+#ifdef _WIN32
+// Windows: TCP の RS-232C は未対応 (Winsock への移植が要る)
+#include <stdio.h>
+x68k::SerialLink* openHostSerialLink(const char* spec, char* err, size_t errSize) {
+    if (err && errSize) err[0] = 0;
+    if (!spec || !spec[0] || !strcmp(spec, "off")) return nullptr;
+    snprintf(err, errSize, "rs232c: not supported on Windows");
+    return nullptr;
+}
+x68k::SerialLink* openHostSerialLinkAt(const char*, unsigned, unsigned*, char* err, size_t errSize) {
+    snprintf(err, errSize, "rs232c: not supported on Windows");
+    return nullptr;
+}
+#else
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -240,3 +256,5 @@ x68k::SerialLink* openHostSerialLinkAt(const char* addr, unsigned port, unsigned
     printf("rs232c: listening on %s (connect with nc or socat)\n", link->name());
     return link;
 }
+
+#endif // _WIN32

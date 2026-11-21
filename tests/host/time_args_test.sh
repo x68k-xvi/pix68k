@@ -16,17 +16,17 @@ trap 'rm -rf "$WORK"' EXIT
 export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 ng=0
 for v in "" 12x -1 " 5" +5 9223372036854775808 99999999999999999999; do
-    "$BIN" -r "$WORK" "$@" --time "$v" > "$WORK/out.txt" 2>&1
+    "$BIN" --no-config -r "$WORK" "$@" --time "$v" > "$WORK/out.txt" 2>&1
     rc=$?
     if [ $rc != 2 ] || ! grep -q -- "--time: want seconds" "$WORK/out.txt"; then
         cat "$WORK/out.txt"; echo "NG: --time '$v' was accepted (exit $rc)"; ng=1
     fi
 done
-"$BIN" -r "$WORK" "$@" --time > "$WORK/out.txt" 2>&1
+"$BIN" --no-config -r "$WORK" "$@" --time > "$WORK/out.txt" 2>&1
 rc=$?
 if [ $rc != 2 ] || ! grep -q "^usage:" "$WORK/out.txt"; then cat "$WORK/out.txt"; echo "NG: --time without a value (exit $rc)"; ng=1; fi
 for v in 0 9223372036854775807; do
-    "$BIN" -r "$WORK" "$@" --time "$v" > "$WORK/out.txt" 2>&1
+    "$BIN" --no-config -r "$WORK" "$@" --time "$v" > "$WORK/out.txt" 2>&1
     rc=$?
     if [ $rc != "$OK_RC" ] || ! grep -qE -- "$OK_TEXT" "$WORK/out.txt" || grep -q -- "--time:" "$WORK/out.txt"; then
         cat "$WORK/out.txt"; echo "NG: --time $v: exit $rc (want exit $OK_RC and /$OK_TEXT/, no --time message)"; ng=1

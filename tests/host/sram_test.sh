@@ -15,7 +15,7 @@ trap 'rm -rf "$WORK"' EXIT
 export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 
 head -c 100 /dev/zero > "$WORK/sram.dat"
-"$PIX68K" -r "$ROM_DIR" --frames 120 --no-wait --sram "$WORK/sram.dat" > "$WORK/out1.txt" 2>&1
+"$PIX68K" --no-config -r "$ROM_DIR" --frames 120 --no-wait --sram "$WORK/sram.dat" > "$WORK/out1.txt" 2>&1
 cat "$WORK/out1.txt"
 grep -q "is not a valid SRAM file (100 bytes); ignored" "$WORK/out1.txt" || { echo "NG: short SRAM file was not rejected"; exit 1; }
 # IPL ROM は SRAM を初期化するので、書き戻されて 16KB になる
@@ -23,7 +23,7 @@ size=$(wc -c < "$WORK/sram.dat" | tr -d ' ')
 [ "$size" = 16384 ] || { echo "NG: SRAM file is $size bytes"; exit 1; }
 if ls "$WORK" | grep -q tmp; then echo "NG: temporary file left"; ls "$WORK"; exit 1; fi
 
-"$PIX68K" -r "$ROM_DIR" --frames 30 --no-wait --sram "$WORK/sram.dat" > "$WORK/out2.txt" 2>&1
+"$PIX68K" --no-config -r "$ROM_DIR" --frames 30 --no-wait --sram "$WORK/sram.dat" > "$WORK/out2.txt" 2>&1
 cat "$WORK/out2.txt"
 grep -q "^SRAM: $WORK/sram.dat" "$WORK/out2.txt" || { echo "NG: SRAM file was not read"; exit 1; }
 # ベアメタル版の形式 (16KB + 後書き) も読める
@@ -33,7 +33,7 @@ data = open(sys.argv[1], "rb").read()
 head = data + b"PX68SRAM" + struct.pack("<I", 3)
 open(sys.argv[2], "wb").write(head + struct.pack("<I", zlib.crc32(head)))
 ' "$WORK/sram.dat" "$WORK/sram_bm.dat"
-"$PIX68K" -r "$ROM_DIR" --frames 30 --no-wait --sram "$WORK/sram_bm.dat" > "$WORK/out3.txt" 2>&1
+"$PIX68K" --no-config -r "$ROM_DIR" --frames 30 --no-wait --sram "$WORK/sram_bm.dat" > "$WORK/out3.txt" 2>&1
 grep -q "^SRAM: $WORK/sram_bm.dat" "$WORK/out3.txt" || { cat "$WORK/out3.txt"; echo "NG: bare-metal SRAM file was not read"; exit 1; }
 # SRAM の 8 バイト目からの 4 バイト (メインメモリの容量) を 16 進で読む / 書く
 sram_mem() { python3 -c 'import sys; print(open(sys.argv[1], "rb").read()[8:12].hex())' "$1"; }

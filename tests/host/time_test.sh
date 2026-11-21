@@ -19,7 +19,7 @@ export SDL_VIDEODRIVER=dummy SDL_AUDIODRIVER=dummy
 
 run() {
     name=$1; shift
-    "$PIX68K" -r "$ROM_DIR" --no-sram --read-only --no-wait -0 "$DISK" --frames 1300 --type 'time\n' --type-after 900 \
+    "$PIX68K" --no-config -r "$ROM_DIR" --no-sram --read-only --no-wait -0 "$DISK" --frames 1300 --type 'time\n' --type-after 900 \
         --screenshot "$WORK/$name.ppm" --wav "$WORK/$name.wav" --dump-text "$@" > "$WORK/$name.txt" 2>&1
 }
 # 1700000000 は、ホストの時間帯によらず 2023-11-14 22:13:20 (時間帯を見ずに地方時として RTC に入れる)

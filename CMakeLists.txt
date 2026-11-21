@@ -644,7 +644,14 @@ if(PIX68K_HOST)
     add_executable(pix68k host/main.cpp host/host_ether.cpp host/host_serial.cpp)
     target_include_directories(pix68k PRIVATE src)
     target_compile_options(pix68k PRIVATE -Wall -Wextra)
+    if(WIN32 AND TARGET SDL2::SDL2main)
+      target_link_libraries(pix68k SDL2::SDL2main)
+      target_link_options(pix68k PRIVATE -mconsole)
+    endif()
     target_link_libraries(pix68k x68k midisynth SDL2::SDL2 Threads::Threads)
+    if(WIN32)
+      target_link_options(pix68k PRIVATE -static-libgcc -static-libstdc++ -static)
+    endif()
     # Neptune-X の neptune_link=pcap:IF に使う。なければ pcap の口なしで作る
     find_path(PCAP_INCLUDE_DIR pcap.h)
     find_library(PCAP_LIBRARY pcap)
@@ -654,42 +661,42 @@ if(PIX68K_HOST)
       target_link_libraries(pix68k ${PCAP_LIBRARY})
     endif()
     # ROM があれば X68000 を、なければテストパターンを 3 フレーム動かす。SRAM のファイルは読み書きしない
-    add_test(NAME host_smoke COMMAND pix68k --frames 3 --no-sram)
-    add_test(NAME host_smoke_pattern COMMAND pix68k --test-pattern --frames 3)
+    add_test(NAME host_smoke COMMAND pix68k --no-config --frames 3 --no-sram)
+    add_test(NAME host_smoke_pattern COMMAND pix68k --no-config --test-pattern --frames 3)
     # --config: ファイル名のキーの空の値 (sc6=、cd=) は指定しなかったことになり、ID の重なりのエラーにならない
     add_test(NAME host_config_empty_values COMMAND sh -c
       "printf 'sc6=\\ncd=\\nscsi_ex_rom=\\n' > host_config_empty.cfg && '$<TARGET_FILE:pix68k>' --config host_config_empty.cfg --frames 3 --no-sram --no-audio")
     # Neptune-X: 試験用の口 (echo) で起動する。知らない口と使えない MAC アドレスはエラーで終わる
-    add_test(NAME host_neptune COMMAND pix68k --frames 3 --no-sram --no-audio --neptune)
-    add_test(NAME host_neptune_bad_link COMMAND pix68k --frames 3 --no-sram --no-audio --neptune-link bogus)
-    add_test(NAME host_neptune_bad_mac COMMAND pix68k --frames 3 --no-sram --no-audio --neptune --neptune-mac 01:00:00:00:00:00)
+    add_test(NAME host_neptune COMMAND pix68k --no-config --frames 3 --no-sram --no-audio --neptune)
+    add_test(NAME host_neptune_bad_link COMMAND pix68k --no-config --frames 3 --no-sram --no-audio --neptune-link bogus)
+    add_test(NAME host_neptune_bad_mac COMMAND pix68k --no-config --frames 3 --no-sram --no-audio --neptune --neptune-mac 01:00:00:00:00:00)
     # 誤りのメッセージで終わること (異常終了で通らないよう、終了コードではなくメッセージを見る)
     set_tests_properties(host_neptune_bad_link PROPERTIES PASS_REGULAR_EXPRESSION "neptune: bad link 'bogus'")
     set_tests_properties(host_neptune_bad_mac PROPERTIES PASS_REGULAR_EXPRESSION "neptune: bad MAC address 01:00:00:00:00:00")
     # MIDI ボード: つないで起動する。読めない SoundFont は、知らせて音源なしで続ける
     # (ROM がなければテストパターンになるので飛ばす)
     add_test(NAME host_midi COMMAND sh -c
-      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --wav host_midi.wav --midi --midi-sf2 /nonexistent.sf2")
+      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --no-config --frames 3 --no-sram --wav host_midi.wav --midi --midi-sf2 /nonexistent.sf2")
     set_tests_properties(host_midi PROPERTIES PASS_REGULAR_EXPRESSION "midi: cannot load the SoundFont /nonexistent.sf2"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # MT-32 の音源: 読めない ROM (ないファイル、大きさの違うファイル) は、知らせて音源なしで続ける
     add_test(NAME host_midi_mt32 COMMAND sh -c
-      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --wav host_midi_mt32.wav --midi-mt32-ctrl /nonexistent.rom --midi-mt32-pcm '${CMAKE_SOURCE_DIR}/LICENSE'")
+      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --no-config --frames 3 --no-sram --wav host_midi_mt32.wav --midi-mt32-ctrl /nonexistent.rom --midi-mt32-pcm '${CMAKE_SOURCE_DIR}/LICENSE'")
     set_tests_properties(host_midi_mt32 PROPERTIES
       PASS_REGULAR_EXPRESSION "midi: cannot load the MT-32 ROMs /nonexistent.rom and .*LICENSE: the CONTROL ROM is not"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # SC-55mkII の音源: ROM のないディレクトリは、知らせて音源なしで続ける
     add_test(NAME host_midi_sc55 COMMAND sh -c
-      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --wav host_midi_sc55.wav --midi-sc55 '${CMAKE_SOURCE_DIR}/external'")
+      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --no-config --frames 3 --no-sram --wav host_midi_sc55.wav --midi-sc55 '${CMAKE_SOURCE_DIR}/external'")
     set_tests_properties(host_midi_sc55 PROPERTIES
       PASS_REGULAR_EXPRESSION "midi: .*external: no rom1.bin \\(R15199858, 32768 bytes\\); MIDI is not played"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     # UART の出力 (ホスト版はファイルに書く): 電源を入れたときのリセットで、16 のチャネルの音を止めるバイト (80 バイト) を書く
     add_test(NAME host_midi_uart COMMAND sh -c
-      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --frames 3 --no-sram --no-audio --midi --midi-out uart --midi-dump host_midi_uart.bin && echo \"dump size $(wc -c < host_midi_uart.bin | tr -d ' ')\"")
+      "test -f \"$HOME/.cache/pix68k/rom/IPLROM.DAT\" || exit 77; '$<TARGET_FILE:pix68k>' --no-config --frames 3 --no-sram --no-audio --midi --midi-out uart --midi-dump host_midi_uart.bin && echo \"dump size $(wc -c < host_midi_uart.bin | tr -d ' ')\"")
     set_tests_properties(host_midi_uart PROPERTIES PASS_REGULAR_EXPRESSION "MIDI: UART bytes to host_midi_uart.bin \\(gs\\).*dump size 80"
       SKIP_RETURN_CODE 77 ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
-    add_test(NAME host_neptune_eth COMMAND pix68k --frames 3 --no-sram --no-audio --neptune-link eth)
+    add_test(NAME host_neptune_eth COMMAND pix68k --no-config --frames 3 --no-sram --no-audio --neptune-link eth)
     set_tests_properties(host_neptune_eth PROPERTIES PASS_REGULAR_EXPRESSION "link eth is for the bare metal build; using echo"
       ENVIRONMENT "SDL_VIDEODRIVER=dummy;SDL_AUDIODRIVER=dummy")
     set_tests_properties(host_smoke host_smoke_pattern host_config_empty_values host_neptune host_neptune_bad_link

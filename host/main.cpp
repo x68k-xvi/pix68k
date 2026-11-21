@@ -83,7 +83,9 @@
 //                    これらのキーは X68000 のキーボードには送らない (既定では送る)
 //   --config FILE    設定ファイル (ベアメタル版の pix68k.cfg と同じ形式と項目。platform/settings.h)。
 //                    コマンドラインのほうが優先する。ファイル名の値は、/ で始まらなければ設定ファイルのディレクトリから。
-//                    メニューの「Save settings」はこのファイルに書く (知らない行と注釈は残す)
+//                    メニューの「Save settings」はこのファイルに書く (知らない行と注釈は残す)。
+//                    省略すると ~/.cache/pix68k/pix68k.cfg を使う (なければ読まず、「Save settings」で作る)
+//   --no-config      設定ファイルを使わない (~/.cache/pix68k/pix68k.cfg も読まない)
 //   --profile NAME   起動の組み合わせ: --config のディレクトリの pix68k-NAME.cfg を、--config のファイルの共通の項目
 //                    (ネットワーク、画面の出し方など) に重ねて読む (platform/boot_profile.h。ベアメタル版の起動時の
 //                    メニューで選ぶのと同じ)。autotype= があれば --type / --type-after (autotype_wait= 秒を 55 フレーム / 秒で
@@ -105,6 +107,14 @@
 // ROM がなければ、そのことを表示してテストパターンを出す (ROM のない CI でも host_smoke が通るように)。
 #include <SDL.h>
 #include <dirent.h>
+
+#ifdef _WIN32
+// Windows (MinGW) 用の置き換え
+#include <io.h>
+#include <stdlib.h>
+static inline int fsync(int fd) { return _commit(fd); }
+static inline char* realpath(const char* p, char* out) { return _fullpath(out, p, PATH_MAX); }
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -728,6 +738,30 @@ bool saveFile(const char* path, const uint8_t* buf, size_t size) {
     return true;
 }
 
+// path の親ディレクトリを (なければ上から順に) 作る
+void makeParentDir(const char* path) {
+    char dir[1200];
+    snprintf(dir, sizeof dir, "%s", path);
+    char* slash = strrchr(dir, '/');
+    if (!slash || slash == dir) return;
+    *slash = 0;
+    for (char* p = dir + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = 0;
+#ifdef _WIN32
+        mkdir(dir);
+#else
+        mkdir(dir, 0755);
+#endif
+        *p = '/';
+    }
+#ifdef _WIN32
+    mkdir(dir);
+#else
+    mkdir(dir, 0755);
+#endif
+}
+
 void writePpm(const uint32_t* pixels, int pitch, int w, int h, const char* path) {
     FILE* f = fopen(path, "wb");
     if (!f) {
@@ -761,9 +795,17 @@ void unescape(const char* in, char* out, size_t size) {
 // 今の地方時を「1970 年からの秒数」で返す (Machine::setTime() は地方時を受け取る)
 int64_t localSeconds() {
     time_t now = time(nullptr);
+#ifdef _WIN32
+    struct tm lt, gt;
+    localtime_s(&lt, &now);
+    gmtime_s(&gt, &now);
+    lt.tm_isdst = 0; gt.tm_isdst = 0;
+    return (int64_t)now + (int64_t)difftime(mktime(&lt), mktime(&gt));
+#else
     struct tm lt;
     localtime_r(&now, &lt);
     return (int64_t)now + lt.tm_gmtoff;
+#endif
 }
 
 struct Options {
@@ -801,7 +843,8 @@ struct Options {
     int videoFilter = 0;                            // video_filter= (同じ)
     bool sramGiven = false;
     bool fixSramMemorySize = true; // --sram-memsize (false なら keep)
-    char config[1024] = {0};    // --config (空ならなし)
+    char config[1024] = {0};    // --config (空ならなし。省略時は ~/.cache/pix68k/pix68k.cfg)
+    bool configDefault = false; // config は --config ではなく既定のパス
     char profile[64] = {0};     // --profile (空ならなし)
     char profilePath[1024] = {0}; // --profile のファイル (--config のディレクトリの pix68k-NAME.cfg)
     char imageDir[1024] = {0};  // --image-dir
@@ -1457,6 +1500,7 @@ public:
                 return false;
             }
         }
+        if (!data && opt_.configDefault) makeParentDir(opt_.config); // 既定のパスに初めて書くとき
         platform::ConfigText text;
         text.load(data ? (const char*)data : "", data ? size : 0);
         free(data);
@@ -2115,7 +2159,7 @@ void usage(const char* argv0) {
             "          [--sram-memsize fix|keep] [--cpu 68000|68030|68060] [--ipl file] [--high-mem MB]\n"
             "          [--local-mem MB] [--ram MB] [--max-speed] [--scsi-ex | --no-scsi-ex] [--scsi-ex-rom file]\n"
             "          [--speed060 percent] [--max-speed-limit percent] [--bus-sync-sprite]\n"
-            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--config file] [--profile name] [--image-dir dir]\n"
+            "          [--sc id file]... [--cd file] [--cd-id id] [--fpu-board [1|2]] [--mercury] [--config file | --no-config] [--profile name] [--image-dir dir]\n"
             "          [--neptune] [--neptune-link echo|loopback|pcap:IF|tap:NAME] [--neptune-mac MAC]\n"
             "          [--rs232c off|tcp:PORT|tcp:ADDR:PORT]\n"
             "          [--midi] [--midi-sf2 file.sf2] [--midi-voices N] [--midi-out sf2|mt32|sc55|none]\n"
@@ -2144,11 +2188,15 @@ bool parseRange(const char* s, int lo, int hi, int& out) {
 int main(int argc, char** argv) {
     static Options opt;
     const char* home = getenv("HOME");
+#ifdef _WIN32
+    if (!home) home = getenv("USERPROFILE");
+#endif
     snprintf(opt.romDir, sizeof opt.romDir, "%s/.cache/pix68k/rom", home ? home : ".");
     snprintf(opt.sram, sizeof opt.sram, "%s/.cache/pix68k/sram.dat", home ? home : ".");
     snprintf(opt.stateDir, sizeof opt.stateDir, "%s/.cache/pix68k", home ? home : ".");
     // 設定ファイル (--config) と組み合わせ (--profile) を先に読む (コマンドラインのほうを優先する)。ほかのオプションの値 (--type "--config" など) を
     // 拾わないよう、値を取るオプションはその値を飛ばす
+    bool noConfig = false; // --no-config
     static const char* const kTakesValue[] = {
         "--frames", "-r", "-0", "-1", "-h", "--sram", "--screenshot", "--type", "--type-after", "--wav", "--time",
         "--sram-memsize", "--cpu", "--ipl", "--high-mem", "--local-mem", "--ram", "--clock", "--scsi-ex-rom",
@@ -2171,21 +2219,34 @@ int main(int argc, char** argv) {
             i++;
             continue;
         }
+        if (!strcmp(argv[i], "--no-config")) {
+            noConfig = true;
+            continue;
+        }
         if (strcmp(argv[i], "--config") != 0 || i + 1 >= argc) continue;
         snprintf(opt.config, sizeof opt.config, "%s", argv[i + 1]);
         i++;
+    }
+    if (noConfig) {
+        opt.config[0] = 0;
+    } else if (!opt.config[0]) {
+        // 既定の設定ファイル。なければ読まないが、メニューの「Save settings」はここに書く
+        snprintf(opt.config, sizeof opt.config, "%s/.cache/pix68k/pix68k.cfg", home ? home : ".");
+        opt.configDefault = true;
     }
     if (opt.profile[0] && !opt.config[0]) {
         fprintf(stderr, "--profile needs --config (the profile is pix68k-NAME.cfg next to it)\n");
         return 2;
     }
-    if (opt.config[0] && !readConfigFile(opt)) return 2;
+    if (opt.config[0] && !(opt.configDefault && access(opt.config, R_OK) != 0) && !readConfigFile(opt)) return 2;
     bool clockGiven = false; // --clock を書いた (CPU に合わなければ警告する)
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
         bool hasArg = i + 1 < argc;
         if ((!strcmp(a, "--config") || !strcmp(a, "--profile")) && hasArg) {
             i++; // 上で読んだ
+        } else if (!strcmp(a, "--no-config")) {
+            // 上で読んだ
         } else if (!strcmp(a, "--image-dir") && hasArg) {
             snprintf(opt.imageDir, sizeof opt.imageDir, "%s", argv[++i]);
         } else if (!strcmp(a, "--state-dir") && hasArg) {
@@ -2394,7 +2455,7 @@ int main(int argc, char** argv) {
     }
     // メニューでイメージを選ぶディレクトリ: 設定ファイルのディレクトリ、なければ ~/.cache/pix68k/disk
     if (!opt.imageDir[0]) {
-        if (opt.config[0]) dirName(opt.config, opt.imageDir, sizeof opt.imageDir);
+        if (opt.config[0] && !opt.configDefault) dirName(opt.config, opt.imageDir, sizeof opt.imageDir);
         else snprintf(opt.imageDir, sizeof opt.imageDir, "%s/.cache/pix68k/disk", home ? home : ".");
     }
     // ハイメモリは X68030 だけ (68000 のアドレスバスは 24 ビットで $01000000 から上を区別できない。060turbo は
