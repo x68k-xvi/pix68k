@@ -23,7 +23,8 @@ Release のビルドは `-fomit-frame-pointer` を付ける (#224。aarch64 の 
 
 Windows は MSYS2 の UCRT64 (`pacman -S mingw-w64-ucrt-x86_64-{gcc,cmake,ninja,SDL2}`) でビルドする。`C:\msys64\ucrt64\bin` を PATH に足して
 次のようにすると `build-win/pix68k.exe` ができる (libgcc と libstdc++ は静的リンク。実行には SDL2.dll を exe の隣に置くか PATH に通す)。
-RS-232C (`--rs232c`) は Windows では使えない。設定ファイルの既定は `%USERPROFILE%/.cache/pix68k/pix68k.cfg` (`--no-config` で使わない)。
+RS-232C (`--rs232c`) は Windows では使えない。既定のファイルの置き場所 (ほかの OS の `~/.cache/pix68k/`) は、Windows では exe のあるディレクトリになる
+(`rom/`、`disk/`、`sram.dat`、`pix68k.cfg`、ステートのファイル。`--no-config` で設定ファイルは使わない)。
 
 ```sh
 cmake -S . -B build-win -G Ninja -DPIX68K_REQUIRE_SDL2=ON

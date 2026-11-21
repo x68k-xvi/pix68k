@@ -1,6 +1,6 @@
 // ホスト版 (Mac/Linux、SDL2) のエントリポイント。X68000 を実時間で動かし、画面を出し、キーボードをつなぐ。
 //   pix68k [-r ROM のディレクトリ] [-0 FD0] [-1 FD1] [-h HDF] [--frames N] [その他]
-//   -r DIR           IPLROM.DAT と CGROM.DAT の場所 (既定 ~/.cache/pix68k/rom)
+//   -r DIR           IPLROM.DAT と CGROM.DAT の場所 (既定 ~/.cache/pix68k/rom。Windows は exe のあるディレクトリの rom)
 //   -0 / -1 FILE     フロッピーディスクのイメージ (XDF / DIM / D88)。書き込めるが、既定ではファイルに書き戻さない
 //   -h FILE          SASI のハードディスクのイメージ (HDF、256 バイト / レコード) を ID 0 につなぐ
 //   --write-back     ディスク (FD、HD) に書き込まれていたら、終了時にイメージのファイルを書き換える
@@ -112,6 +112,8 @@
 // Windows (MinGW) 用の置き換え
 #include <io.h>
 #include <stdlib.h>
+extern "C" __declspec(dllimport) unsigned long __stdcall GetModuleFileNameA(void*, char*, unsigned long);
+typedef unsigned long DWORD;
 static inline int fsync(int fd) { return _commit(fd); }
 static inline char* realpath(const char* p, char* out) { return _fullpath(out, p, PATH_MAX); }
 #endif
@@ -956,14 +958,32 @@ void unloadDisk(x68k::Machine& m, int drive, Disk& d, bool writeBack) {
 void dirName(const char* path, char* dir, size_t size) {
     snprintf(dir, size, "%s", path);
     char* slash = strrchr(dir, '/');
+#ifdef _WIN32
+    char* back = strrchr(dir, '\\'); // Windows は \ も区切り (--config C:\dir\pix68k.cfg)
+    if (back && (!slash || back > slash)) slash = back;
+    if (slash && slash == dir + 2 && dir[1] == ':') { // C:\file → C:\
+        slash[1] = 0;
+        return;
+    }
+#endif
     if (slash == dir) slash[1] = 0;
     else if (slash) *slash = 0;
     else snprintf(dir, size, ".");
 }
 
+// 絶対パスか (Windows はドライブ付きと \ で始まるものも)
+bool isAbsolutePath(const char* p) {
+    if (p[0] == '/') return true;
+#ifdef _WIN32
+    if (p[0] == '\\') return true;
+    if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':') return true;
+#endif
+    return false;
+}
+
 // 設定ファイルの値のファイル名: / で始まらなければ、設定ファイルのあるディレクトリから
 void configPath(const char* cfg, const char* value, char* out, size_t size) {
-    if (value[0] == 0 || value[0] == '/' || !cfg[0]) {
+    if (value[0] == 0 || isAbsolutePath(value) || !cfg[0]) {
         snprintf(out, size, "%s", value);
         return;
     }
@@ -1137,12 +1157,14 @@ platform::Settings runningSettings(const Options& opt) {
 bool readConfigFile(Options& opt) {
     size_t size = 0;
     uint8_t* data = loadWhole(opt.config, size);
-    if (!data) {
+    // 既定の設定ファイルがなくても、--profile があればそのファイルだけで起動できる
+    const bool noDefault = !data && opt.configDefault && opt.profile[0];
+    if (!data && !noDefault) {
         fprintf(stderr, "--config: cannot read %s\n", opt.config);
         return false;
     }
     platform::ConfigText text, prof;
-    text.load((const char*)data, size);
+    text.load(noDefault ? "" : (const char*)data, noDefault ? 0 : size);
     free(data);
     if (opt.profile[0]) {
         char name[64], dir[1024];
@@ -2191,9 +2213,26 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
     if (!home) home = getenv("USERPROFILE");
 #endif
-    snprintf(opt.romDir, sizeof opt.romDir, "%s/.cache/pix68k/rom", home ? home : ".");
-    snprintf(opt.sram, sizeof opt.sram, "%s/.cache/pix68k/sram.dat", home ? home : ".");
-    snprintf(opt.stateDir, sizeof opt.stateDir, "%s/.cache/pix68k", home ? home : ".");
+    // 既定のファイルの置き場所。Windows は exe のあるディレクトリ、それ以外は ~/.cache/pix68k
+    static char base[1100];
+#ifdef _WIN32
+    {
+        DWORD n = GetModuleFileNameA(nullptr, base, sizeof base);
+        if (n == 0 || n >= sizeof base) {
+            snprintf(base, sizeof base, ".");
+        } else {
+            for (char* c = base; *c; c++)
+                if (*c == '\\') *c = '/';
+            char* slash = strrchr(base, '/');
+            if (slash) *slash = 0;
+        }
+    }
+#else
+    snprintf(base, sizeof base, "%s/.cache/pix68k", home ? home : ".");
+#endif
+    snprintf(opt.romDir, sizeof opt.romDir, "%s/rom", base);
+    snprintf(opt.sram, sizeof opt.sram, "%s/sram.dat", base);
+    snprintf(opt.stateDir, sizeof opt.stateDir, "%s", base);
     // 設定ファイル (--config) と組み合わせ (--profile) を先に読む (コマンドラインのほうを優先する)。ほかのオプションの値 (--type "--config" など) を
     // 拾わないよう、値を取るオプションはその値を飛ばす
     bool noConfig = false; // --no-config
@@ -2231,14 +2270,14 @@ int main(int argc, char** argv) {
         opt.config[0] = 0;
     } else if (!opt.config[0]) {
         // 既定の設定ファイル。なければ読まないが、メニューの「Save settings」はここに書く
-        snprintf(opt.config, sizeof opt.config, "%s/.cache/pix68k/pix68k.cfg", home ? home : ".");
+        snprintf(opt.config, sizeof opt.config, "%s/pix68k.cfg", base);
         opt.configDefault = true;
     }
     if (opt.profile[0] && !opt.config[0]) {
         fprintf(stderr, "--profile needs --config (the profile is pix68k-NAME.cfg next to it)\n");
         return 2;
     }
-    if (opt.config[0] && !(opt.configDefault && access(opt.config, R_OK) != 0) && !readConfigFile(opt)) return 2;
+    if (opt.config[0] && !(opt.configDefault && !opt.profile[0] && access(opt.config, R_OK) != 0) && !readConfigFile(opt)) return 2;
     bool clockGiven = false; // --clock を書いた (CPU に合わなければ警告する)
     for (int i = 1; i < argc; i++) {
         const char* a = argv[i];
@@ -2456,7 +2495,7 @@ int main(int argc, char** argv) {
     // メニューでイメージを選ぶディレクトリ: 設定ファイルのディレクトリ、なければ ~/.cache/pix68k/disk
     if (!opt.imageDir[0]) {
         if (opt.config[0] && !opt.configDefault) dirName(opt.config, opt.imageDir, sizeof opt.imageDir);
-        else snprintf(opt.imageDir, sizeof opt.imageDir, "%s/.cache/pix68k/disk", home ? home : ".");
+        else snprintf(opt.imageDir, sizeof opt.imageDir, "%s/disk", base);
     }
     // ハイメモリは X68030 だけ (68000 のアドレスバスは 24 ビットで $01000000 から上を区別できない。060turbo は
     // ローカルメモリを使う)
@@ -2508,7 +2547,7 @@ int main(int argc, char** argv) {
         do {
             // X68030 と 060turbo の SRAM は X68000 のものと分ける (メモリの容量などが違う)
             if (!opt.sramGiven)
-                snprintf(opt.sram, sizeof opt.sram, "%s/.cache/pix68k/%s", home ? home : ".",
+                snprintf(opt.sram, sizeof opt.sram, "%s/%s", base,
                          opt.cpu == 68030 ? "sram30.dat" : opt.cpu == 68060 ? "sram060.dat" : "sram.dat");
             rc = runMachine(opt);
         } while (rc == kRestart);
