@@ -96,6 +96,17 @@ void testBasic() {
             fesetround(hostRnd[r]);
             double hadd = va + vb, hsub = va - vb, hmul = va * vb, hdiv = va / vb, hsqrt = std::sqrt(std::fabs(va));
             fesetround(FE_TONEAREST);
+#ifdef __MINGW32__
+            // MinGW の -O2 では std::sqrt が fesetround に従わず、常に最近接で丸める。最近接の結果 q の誤差
+            // fma(q, q, -x) の符号から、丸めの方向つきの正しい値を作る
+            {
+                volatile double ax = std::fabs(va);
+                double x = ax, q = std::sqrt(x), err = std::fma(q, q, -x);
+                hsqrt = q;
+                if (err > 0 && (r == 1 || r == 2)) hsqrt = std::nextafter(q, 0.0); // 真の値は q より小さい
+                else if (err < 0 && r == 3) hsqrt = std::nextafter(q, INFINITY);   // 真の値は q より大きい
+            }
+#endif
             double got;
             checks += 5;
             got = toD(add(xa, xb, c, PREC_D), r);
@@ -147,6 +158,14 @@ void testExtended() {
     }
 }
 
+// MinGW-w64 (MSYS2) の libm の expm1 と atanh は 2 ulp ずれることがある。atanh と etoxm1 の失敗した入力 16 件を、
+// Decimal の 70 桁で求めた値と比べると、エミュレータは全部一致し、libm が 2 ulp ずれていた
+#ifdef __MINGW32__
+constexpr int MINGW_LIBM_ULP = 2;
+#else
+constexpr int MINGW_LIBM_ULP = 1;
+#endif
+
 void testTrans() {
     struct F {
         const char* name;
@@ -172,10 +191,10 @@ void testTrans() {
         // aarch64 の Linux の glibc の tanh は 1 ulp より大きくずれることがある。tanh(-0.5100037765677623) の正しく丸めた値は
         // bfde13a15e94faa2 (Decimal の 60 桁で確かめた) だが、glibc は bfde13a15e94faa0 を返す (#139)
         {"tanh", ftanh, [](double x) { return std::tanh(x); }, -30, 30, false, false, 2},
-        {"atanh", fatanh, [](double x) { return std::atanh(x); }, -1, 1, false},
+        {"atanh", fatanh, [](double x) { return std::atanh(x); }, -1, 1, false, false, MINGW_LIBM_ULP},
         {"etox", fetox, [](double x) { return std::exp(x); }, -700, 700, false},
-        {"etoxm1", fetoxm1, [](double x) { return std::expm1(x); }, -2, 2, false},
-        {"etoxm1-small", fetoxm1, [](double x) { return std::expm1(x); }, 1e-300, 1e-1, true, true},
+        {"etoxm1", fetoxm1, [](double x) { return std::expm1(x); }, -2, 2, false, false, MINGW_LIBM_ULP},
+        {"etoxm1-small", fetoxm1, [](double x) { return std::expm1(x); }, 1e-300, 1e-1, true, true, MINGW_LIBM_ULP},
         {"twotox", ftwotox, [](double x) { return std::exp2(x); }, -1000, 1000, false},
         {"tentox", ftentox, [](double x) { return ::pow(10.0, x); }, -300, 300, false},
         {"logn", flogn, [](double x) { return std::log(x); }, 1e-300, 1e300, true},
