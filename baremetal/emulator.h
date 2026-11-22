@@ -76,6 +76,11 @@ public:
     bool init(const uint8_t* ipl, const uint8_t* cg, int64_t localSeconds, const x68k::Config& config = x68k::Config(),
               bool renderCore = true, bool soundCore = true, const uint8_t* scsiRom = nullptr);
     x68k::Machine& machine() { return *machine_; }
+    bool initTs6bga(uint32_t base);
+    const x68k::Ts6bga* takeTs6bga() {
+        const int i = tsHandoff_.take();
+        return i < 0 ? nullptr : tsFrames_ + i;
+    }
 
     // ---- コア 1 ----
     // 電源を入れ、フレームごとに実時間に合わせて動かし続ける (戻らない)。
@@ -265,6 +270,13 @@ public:
         const unsigned go = __atomic_load_n(&soundCoreGo_, __ATOMIC_ACQUIRE);
         return go == 1 ? synth_->latencyGoal() : go == 2 ? machine_->sound().latencyGoal() : 0;
     }
+    // 前に取ってからの音の大きさ (ログ用。x68k::Sound::takeLevels())。音を作っている方の Sound から取る
+    x68k::Sound::Levels takeAudioLevels() {
+        const unsigned go = __atomic_load_n(&soundCoreGo_, __ATOMIC_ACQUIRE);
+        if (go == 1) return synth_->takeLevels();
+        if (go == 2) return machine_->sound().takeLevels();
+        return {0, 0, 0};
+    }
     // 合成したフレームの数と、そのうちコア 0 が取る前に次のフレームで置き換わった (画面に出なかった) 数
     void frameCounts(uint32_t& published, uint32_t& dropped) const {
         published = handoff_.published();
@@ -272,6 +284,8 @@ public:
     }
 
 private:
+    x68k::Ts6bga* tsFrames_ = nullptr;
+    platform::FrameHandoff tsHandoff_;
     // 表示期間が終わったら (onFrameEnd)、描き終えたフレームをコア 0 に渡す
     class FrameRenderer : public x68k::Renderer {
     public:

@@ -31,6 +31,7 @@
 //   --cpu 68000|68030: 68030 なら X68030 (25MHz、68882)。IPL ROM の既定は IPLROM30.DAT になり、
 //                      --scsi-rom がなければ内蔵 SCSI の ROM を IPL ROM から作る
 //   --ipl ファイル: IPL ROM のファイル (既定は ROM のディレクトリの IPLROM.DAT / IPLROM30.DAT)
+//   --ts6bga: TS-6BGA を $EE0000 につなぐ。--ts6bga-out FILE: 終了時の仮想VRAMをPPMで保存 (接続も行う)
 //   --fpu-board: 数値演算プロセッサボード (CZ-6BP1 相当) をつなぐ。--mercury: まーきゅりーゆにっとをつなぐ
 //   --high-mem MB: X68030 のハイメモリ ($01000000 から、最大 16MB)
 //   --cpu 68060: 060turbo (68060 50MHz)。IPL ROM の既定は ROM のディレクトリの IPLROM060.DAT (68060 で動く IPL ROM。
@@ -291,7 +292,8 @@ int main(int argc, char** argv) {
     size_t hdsSize = 0;
     bool sasiTrace = false, scsiTrace = false, traceUnimpl = false;
     const char* scsiExRom = nullptr;
-    bool fpuBoard = false, mercury = false;
+    bool fpuBoard = false, mercury = false, ts6bga = false;
+    const char* ts6bgaOut = nullptr;
     const char* seHds = nullptr;
     const char* cdIso = nullptr;
     int cdId = 6;
@@ -372,6 +374,10 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--ipl") && i + 1 < argc) iplPath = argv[++i];
         else if (!strcmp(argv[i], "--fpu-board")) fpuBoard = true;
         else if (!strcmp(argv[i], "--mercury")) mercury = true;
+        else if (!strcmp(argv[i], "--ts6bga")) ts6bga = true;
+        else if (!strcmp(argv[i], "--ts6bga-out") && i + 1 < argc) {
+            ts6bga = true; ts6bgaOut = argv[++i];
+        }
         else if (!strcmp(argv[i], "--high-mem") && i + 1 < argc) config.highMemSize = (uint32_t)atoi(argv[++i]) << 20;
         else if (!strcmp(argv[i], "--local-mem") && i + 1 < argc) localMemMB = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--bus-sync") && i + 1 < argc) busSyncNs = atoi(argv[++i]);
@@ -386,7 +392,7 @@ int main(int argc, char** argv) {
                     "          [--type text] [--after frames] [--expect text]... [--reject text]... [--dump-text] [--check-prompt]\n"
                     "          [--wav out.wav] [--expect-sound N] [--time seconds]\n"
                     "          [-h hdf] [--sasi-trace] [--scsi-rom rom] [-s hds] [--save-hds file] [--scsi-trace] [--clock MHz]\n"
-                    "          [--scsi-ex-rom rom] [--se hds] [--cd iso] [--cd-id N] [--boot-rom hexaddr] [--fpu-board] [--mercury]\n"
+                    "          [--scsi-ex-rom rom] [--se hds] [--cd iso] [--cd-id N] [--boot-rom hexaddr] [--fpu-board] [--mercury] [--ts6bga] [--ts6bga-out file.ppm]\n"
                     "          [--neptune] [--save-0 file]\n"
                     "          [--cpu 68000|68030|68060] [--ipl iplrom] [--high-mem MB] [--local-mem MB] [--ram MB] [--trace-unimpl]\n"
                     "          [--bus-wait N] [--bus-sync ns] [--bus-sync-areas n] [--bus-area name=pre,period,post]\n",
@@ -547,6 +553,7 @@ int main(int argc, char** argv) {
     }
     if (fpuBoard) m.setFpuBoard(true);
     if (mercury) m.setMercury(true);
+    if (ts6bga && !m.setTs6bga(true)) { fprintf(stderr, "cannot allocate TS-6BGA\n"); return 1; }
     static platform::EchoPeer echoPeer;
     if (neptune) {
         if (!m.setNeptune(true)) {
@@ -722,6 +729,25 @@ int main(int argc, char** argv) {
     if (out[0]) {
         writeScreen(screen, x68k::Renderer::MAX_WIDTH, renderer.width(), renderer.height(), out);
         printf("screen %dx%d: %s\n", renderer.width(), renderer.height(), out);
+    }
+    if (ts6bgaOut) {
+        auto& b = *m.ts6bga();
+        const int w = int(b.width()), h = int(b.height());
+        uint8_t* rgb = new uint8_t[size_t(w) * h * 3];
+        int sw = 0, sh = 0;
+        FILE* f = fopen(ts6bgaOut, "wb");
+        if (!f || !b.snapshotRgb(rgb, unsigned(w * h * 3), sw, sh)) {
+            if (f) fclose(f);
+            delete[] rgb;
+            fprintf(stderr, "cannot save TS-6BGA screenshot\n"); return 1;
+        }
+        const bool header = fprintf(f, "P6\n%d %d\n255\n", sw, sh) > 0;
+        const size_t bytes = size_t(sw) * sh * 3;
+        const bool saved = fwrite(rgb, 1, bytes, f) == bytes;
+        const bool closed = fclose(f) == 0;
+        delete[] rgb;
+        if (!header || !saved || !closed) return 1;
+        printf("TS-6BGA screen %dx%d (selected=%d): %s\n", sw, sh, b.selected(), ts6bgaOut);
     }
     if (wavPath) {
         printf("wav: %u frames (%.2f s) to %s\n", wav.frames(), wav.frames() / 48000.0, wavPath);

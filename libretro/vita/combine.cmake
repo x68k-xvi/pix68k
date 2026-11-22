@@ -1,0 +1,5 @@
+get_filename_component(archive_dir "${INPUT}" DIRECTORY)
+execute_process(COMMAND "${ARCHIVER}" -M INPUT_FILE "${INPUT}" WORKING_DIRECTORY "${archive_dir}" RESULT_VARIABLE result)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "Unable to combine libretro archive: ${result}")
+endif()

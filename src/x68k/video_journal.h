@@ -54,7 +54,8 @@ public:
     void setClock(uint64_t (*clock)()) { clock_ = clock; }
     uint64_t clockNow() const { return clock_ ? clock_() : 0; }
     // 読み手に見せたあとに呼ぶ関数 (読み手を起こす。ベアメタルなら sev。nullptr なら何もしない)
-    void setWake(void (*wake)()) { wake_ = wake; }
+    void setWake(void (*wake)()) { wake_ = wake; wakeContextFn_ = nullptr; }
+    void setWakeContext(void (*wake)(void*), void* context) { wake_ = nullptr; wakeContextFn_ = wake; wakeContext_ = context; }
     unsigned capacity() const { return size_; }
 
     // ---- 書き手 ----
@@ -67,7 +68,8 @@ public:
     void publish() {
         published_ = head_;
         __atomic_store_n(&shared_.head, head_, __ATOMIC_RELEASE);
-        if (wake_) wake_();
+        if (wakeContextFn_) wakeContextFn_(wakeContext_);
+        else if (wake_) wake_();
     }
     // ためた記録をすべて見せ、読み手が処理し終えるまで待つ。戻ったあとは、読み手が書いた画素を読んでよい
     void flush();
@@ -113,6 +115,8 @@ private:
     unsigned head_ = 0, published_ = 0, tailCache_ = 0;
     void (*relax_)() = nullptr;
     void (*wake_)() = nullptr;
+    void (*wakeContextFn_)(void*) = nullptr;
+    void* wakeContext_ = nullptr;
     uint64_t (*clock_)() = nullptr;
     Stats stats_;
     // 読み手だけが使う

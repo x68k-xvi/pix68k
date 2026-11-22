@@ -16,7 +16,8 @@
 //
 // 起動時のメニュー (BootMenu): 一覧の先頭は pix68k.cfg (組み合わせなし)。↑↓ で選び、Enter で決める。profile_wait= 秒
 // 何も押さなければ前回のもの。何か押したら待つのをやめる。
-// 題の字は ASCII を platform/menu_font.h、半角カタカナと全角を CGROM で描く (platform/osd_message.h と同じ)。
+// 題の字は UTF-8 か Shift_JIS (profileTitle())。ASCII を platform/menu_font.h、半角カタカナと全角を CGROM で描く
+// (platform/text_cells.h)。
 //
 // ベアメタルでも使えるよう、例外、RTTI、STL、stdio は使わない (ヘッダだけ)。
 #pragma once
@@ -31,6 +32,7 @@
 #include "platform/osd_message.h"
 #include "platform/settings.h"
 #include "platform/settings_file.h"
+#include "platform/text_cells.h"
 
 namespace platform {
 
@@ -102,31 +104,104 @@ inline bool profileFileName(const char* name, char* out, size_t size, bool tmp =
     return strlen(out) == strlen(name) + 11;
 }
 
-// ファイルの 1 行目が「#」で始まれば、その残り (前後の空白を除く) を out に入れる。UTF-8 の BOM は飛ばす。
-// 題がなければ false (out は空)
-inline bool profileTitle(const char* data, size_t n, char* out, size_t size) {
+// ---------------------------------------------------------------- 題の字 (UTF-8 か Shift_JIS)
+
+namespace profile_detail {
+// s[0..n) が、続くバイト次第で正しい UTF-8 の 1 字になりうる途中までの並びか (n は 1 以上で、その字の長さより短い)。
+// 1 バイト目ごとの 2 バイト目の範囲で、長すぎる形 (C0、C1、E0 80 など)、サロゲート (ED A0 から)、0x10FFFF より大きいもの
+// (F4 90 から、F5 から) を除く
+inline bool utf8Prefix(const uint8_t* s, size_t n) {
+    const uint8_t c = s[0];
+    size_t len;
+    uint8_t lo = 0x80, hi = 0xbf;
+    if (c >= 0xc2 && c <= 0xdf) len = 2;
+    else if (c >= 0xe0 && c <= 0xef) {
+        len = 3;
+        if (c == 0xe0) lo = 0xa0;
+        if (c == 0xed) hi = 0x9f;
+    } else if (c >= 0xf0 && c <= 0xf4) {
+        len = 4;
+        if (c == 0xf0) lo = 0x90;
+        if (c == 0xf4) hi = 0x8f;
+    } else {
+        return false;
+    }
+    if (n >= len) return false;
+    if (n >= 2 && (s[1] < lo || s[1] > hi)) return false;
+    for (size_t k = 2; k < n; k++)
+        if ((s[k] & 0xc0) != 0x80) return false;
+    return true;
+}
+
+// s[0..n) が正しい UTF-8 か (utf8Next() が U+FFFD に置き換える並びがないか)。partial なら、終わりで切れた 1 字は、
+// 続くバイト次第で正しい UTF-8 になりうるときだけ許す (ファイルの頭だけを読み、1 行目がその終わりで切れているとき)
+inline bool utf8Valid(const char* s, size_t n, bool partial) {
+    size_t i = 0;
+    while (i < n) {
+        const uint8_t c = (uint8_t)s[i];
+        size_t at = i;
+        uint32_t cp;
+        utf8Next(s, n, at, cp);
+        if (c >= 0x80 && at == i + 1) return partial && utf8Prefix((const uint8_t*)s + i, n - i);
+        i = at;
+    }
+    return true;
+}
+
+// Shift_JIS の s の先頭 max バイト以内で、字の切れ目になるいちばん長い長さ (sjisNext() で読む切れ目)
+inline size_t sjisTruncate(const char* s, size_t n, size_t max) {
+    if (n <= max) return n;
+    size_t i = 0, last = 0;
+    uint16_t code;
+    int width;
+    while (text_detail::sjisNext(s, n, i, code, width) && i <= max) last = i;
+    return last;
+}
+} // namespace profile_detail
+
+// ファイルの 1 行目が「#」で始まれば、その残り (前後の空白を除く) を out に入れる。題がなければ false (out は空)。
+// 字は UTF-8 か Shift_JIS: 1 行目が正しい UTF-8 ならそのまま、そうでなければ Shift_JIS とみなして *sjis を true にする
+// (ASCII だけの行はどちらでも同じなので UTF-8 とする)。UTF-8 の BOM があれば飛ばして UTF-8 とする。
+// 見分けは切り詰める前の行全体で行う (切ったあとの Shift_JIS が、たまたま正しい UTF-8 になることがあるため)。
+// 半角カタカナ 2 字の並びの一部 (0xC2-0xDF のあとに 0xA1-0xBF) は正しい UTF-8 でもあるので、その字だけの題は
+// UTF-8 とみなす。
+// partial: data がファイルの頭だけで、続きがある (読む上限で止まった)。1 行目が data の終わりで切れていれば、最後の
+// 欠けた 1 字を UTF-8 の誤りとみなさない。ファイルの終わりまで読んだときは false にする
+inline bool profileTitle(const char* data, size_t n, char* out, size_t size, bool* sjis = nullptr,
+                         bool partial = false) {
+    if (sjis != nullptr) *sjis = false;
     if (size == 0) return false;
     out[0] = 0;
     size_t i = 0;
-    if (n >= 3 && (uint8_t)data[0] == 0xef && (uint8_t)data[1] == 0xbb && (uint8_t)data[2] == 0xbf) i = 3;
+    bool bom = false;
+    if (n >= 3 && (uint8_t)data[0] == 0xef && (uint8_t)data[1] == 0xbb && (uint8_t)data[2] == 0xbf) {
+        i = 3;
+        bom = true;
+    }
     if (i >= n || data[i] != '#') return false;
     i++;
     while (i < n && (data[i] == ' ' || data[i] == '\t' || data[i] == '#')) i++;
     size_t e = i;
     while (e < n && data[e] != '\r' && data[e] != '\n') e++;
+    const size_t lineEnd = e;
     while (e > i && (data[e - 1] == ' ' || data[e - 1] == '\t')) e--;
+    // 1 行目が読む上限で切れていて、最後の字のあとに空白もないときだけ、その字が欠けているとみなせる
+    // (空白が続いていれば、その前の字は欠けた UTF-8 の字ではない)
+    const bool cutOff = partial && lineEnd == n && e == n;
     size_t len = e - i;
+    const bool isSjis = !bom && !profile_detail::utf8Valid(data + i, len, cutOff);
     const size_t max = size - 1 < (size_t)PROFILE_TITLE_MAX ? size - 1 : (size_t)PROFILE_TITLE_MAX;
-    len = utf8Truncate(data + i, len, max);
+    len = isSjis ? profile_detail::sjisTruncate(data + i, len, max) : utf8Truncate(data + i, len, max);
     memcpy(out, data + i, len);
     out[len] = 0;
+    if (sjis != nullptr) *sjis = isSjis && len > 0;
     return len > 0;
 }
 
 // 組み合わせを選んだときも pix68k.cfg から受け継ぐ「共通の項目」か (上の説明を参照)
 inline bool isCommonSettingKey(const char* key) {
     static const char* const kCommon[] = {"net",       "net_ip",    "net_gw",           "net_dns",    "net_name",
-                                          "net_allow", "net_token", "syslog",           "keyboard",   "hat",
+                                          "net_allow", "net_token", "syslog",           "keyboard",   "hat",       "pad_log",
                                           "video_filter", "video_scale", "osd",       "render_core", "sound_core",
                                           "midi_uart", "midi_uart_family", "write_back", "profile_wait",
                                           // 前の書き方 (v0.1.0 の scale= と scanline= は読み替え、crt= は知らせて無視する)。
@@ -207,6 +282,7 @@ public:
     struct Entry {
         char name[PROFILE_NAME_MAX + 1];
         char title[PROFILE_TITLE_MAX + 1];
+        bool sjis; // title が Shift_JIS (profileTitle() の *sjis)
     };
     ProfileList() {}
     ~ProfileList() { delete[] entries_; }
@@ -217,8 +293,9 @@ public:
     void keep(const char* name) { copyString(keep_, sizeof keep_, name ? name : ""); }
 
     // 名前の順 (大文字と小文字を区別しない) に入れる。同じ名前はあとから足したものを捨てる。
-    // PROFILE_MAX を超えたら、名前の順で後ろのものを捨てる (keep() の名前は捨てない)。メモリが足りなければ false
-    bool add(const char* name, const char* title) {
+    // PROFILE_MAX を超えたら、名前の順で後ろのものを捨てる (keep() の名前は捨てない)。メモリが足りなければ false。
+    // sjis は title が Shift_JIS か
+    bool add(const char* name, const char* title, bool sjis = false) {
         if (!validProfileName(name)) return false;
         if (entries_ == nullptr) {
             entries_ = new Entry[PROFILE_MAX];
@@ -240,6 +317,7 @@ public:
         for (int i = count_; i > at; i--) entries_[i] = entries_[i - 1];
         copyString(entries_[at].name, sizeof entries_[at].name, name);
         copyString(entries_[at].title, sizeof entries_[at].title, title ? title : "");
+        entries_[at].sjis = sjis && title != nullptr && title[0] != 0;
         count_++;
         return true;
     }
@@ -387,95 +465,6 @@ private:
     bool pending_ = false;
 };
 
-// ---------------------------------------------------------------- 字を 1 行に並べる
-
-// UTF-8 の s を、maxCols 桁 (半角の桁。全角は 2 桁) の升目に並べる (コードは platform/osd_message.h の升目と同じ:
-// ASCII、半角カタカナ 0xA1-0xDF、全角の区点か MSG_CELL_TOFU、その右の桁は MSG_CELL_RIGHT)。
-// 入りきらなければ、最後を「…」(全角) にする。並べた桁数を返す
-inline int layoutLine(const char* s, uint16_t* cells, int maxCols) {
-    int col = 0;
-    size_t i = 0;
-    const size_t n = strlen(s);
-    uint32_t cp;
-    bool cut = false;
-    while (utf8Next(s, n, i, cp)) {
-        if (cp == '\t') cp = ' ';
-        if (cp < 0x20 || cp == 0x7f || (cp >= 0x80 && cp < 0xa0)) continue;
-        uint16_t code;
-        int width = 1;
-        if (cp < 0x80) code = (uint16_t)cp;
-        else if (cp == 0xfffd) code = '?';
-        else if (cp >= 0xff61 && cp <= 0xff9f) code = (uint16_t)(cp - 0xff61 + 0xa1);
-        else if (const uint16_t jis = unicodeToJis(cp)) {
-            code = jis;
-            width = 2;
-        } else if (cp >= 0x1100) {
-            code = MSG_CELL_TOFU;
-            width = 2;
-        } else {
-            code = '?';
-        }
-        if (col + width > maxCols) {
-            cut = true;
-            break;
-        }
-        cells[col++] = code;
-        if (width == 2) cells[col++] = MSG_CELL_RIGHT;
-    }
-    if (!cut || maxCols < 2) return col;
-    int at = col > maxCols - 2 ? maxCols - 2 : col;
-    if (at > 0 && at < col && cells[at] == MSG_CELL_RIGHT) at--;
-    cells[at] = MSG_JIS_ELLIPSIS;
-    cells[at + 1] = MSG_CELL_RIGHT;
-    return at + 2;
-}
-
-// 升目の字を描く (8 * scale x 16 * scale の桁)。xmax と ymax を超える分は描かない。cgrom がなければ全角は豆腐
-inline void drawCells(uint32_t* pixels, int pitch, int xmax, int ymax, int x, int y, const uint16_t* cells, int cols,
-                      int scale, uint32_t color, const uint8_t* cgrom, size_t cgromSize) {
-    for (int c = 0; c < cols; c++) {
-        const uint16_t code = cells[c];
-        if (code == MSG_CELL_RIGHT) continue;
-        uint8_t g[2][16] = {};
-        int width = 1;
-        if (code >= MENU_FONT_FIRST && code <= MENU_FONT_LAST) {
-            memcpy(g[0], kMenuFont[code - MENU_FONT_FIRST], 16);
-        } else if (code >= 0xa1 && code <= 0xdf) {
-            const size_t off = CGROM_FONT8X16 + (size_t)code * 16;
-            if (cgrom != nullptr && off + 16 <= cgromSize) memcpy(g[0], cgrom + off, 16);
-            else memcpy(g[0], kMenuFont['?' - MENU_FONT_FIRST], 16);
-        } else {
-            width = 2;
-            const long off = code == MSG_CELL_TOFU ? -1 : cgromFont16Offset(code);
-            bool drawn = false;
-            if (cgrom != nullptr && off >= 0 && (size_t)off + 32 <= cgromSize) {
-                uint8_t any = 0;
-                for (int k = 0; k < 16; k++) {
-                    g[0][k] = cgrom[off + 2 * k];
-                    g[1][k] = cgrom[off + 2 * k + 1];
-                    any |= g[0][k] | g[1][k];
-                }
-                drawn = any != 0 || code == 0x2121;
-            }
-            if (!drawn && code == MSG_JIS_ELLIPSIS) message_detail::ellipsis(g[0], g[1]);
-            else if (!drawn) message_detail::tofu(g[0], g[1]);
-        }
-        for (int h = 0; h < width; h++) {
-            const int x0 = x + (c + h) * 8 * scale;
-            for (int gy = 0; gy < 16 * scale; gy++) {
-                const int py = y + gy;
-                if (py < 0 || py >= ymax) continue;
-                const uint8_t bits = g[h][gy / scale];
-                uint32_t* row = pixels + (size_t)py * pitch;
-                for (int gx = 0; gx < 8 * scale; gx++) {
-                    const int px = x0 + gx;
-                    if (px >= 0 && px < xmax && (bits & (0x80 >> (gx / scale)))) row[px] = color;
-                }
-            }
-        }
-    }
-}
-
 // ---------------------------------------------------------------- 起動時のメニュー
 
 class BootMenu {
@@ -563,8 +552,8 @@ public:
             }
         }
         uint16_t cells[COLS + 2];
-        auto text = [&](int line, const char* s, uint32_t color) {
-            const int n = layoutLine(s, cells, cols);
+        auto text = [&](int line, const char* s, uint32_t color, bool sjis = false) {
+            const int n = layoutLine(s, cells, cols, sjis);
             drawCells(pixels, pitch, x1, y1, x0 + 8 * scale, y0 + (8 + line * 16) * scale, cells, n, scale,
                       color | opaque, cgrom, cgromSize);
         };
@@ -582,11 +571,12 @@ public:
             MenuText t(buf, sizeof buf);
             t.add(rowName(r));
             const char* title = r == 0 ? "" : list_->at(r - 1).title;
+            const bool sjis = r != 0 && list_->at(r - 1).sjis; // 名前と空白は ASCII なので、行ごと題の字で読める
             if (title[0]) {
                 for (int k = (int)strlen(buf); k < 12; k++) t.add(" ");
                 t.add(" ").add(title);
             }
-            text(line, buf, 0xffffffu);
+            text(line, buf, 0xffffffu, sjis);
         }
         MenuText t(buf, sizeof buf);
         t.add("Up/Down, Enter");

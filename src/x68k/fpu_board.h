@@ -38,7 +38,9 @@
 
 #include <stdint.h>
 
+#ifndef PIX68K_NO_FPU_BOARD
 #include "m68k/fpu_core.h"
+#endif
 
 namespace x68k {
 
@@ -51,6 +53,7 @@ public:
     static constexpr uint32_t SIZE = 0x20;
     static constexpr int MAX_BOARDS = 2;
 
+#ifndef PIX68K_NO_FPU_BOARD
     FpuBoard() { reset(); }
     void reset();
 
@@ -131,6 +134,7 @@ private:
     int len_ = 0, pos_ = 0;  // P_IN / P_OUT / P_SAVE / P_RESTORE で送るバイト数と送った数
     uint32_t fpiarHi_ = 0;   // 命令アドレスの上位の語
     uint8_t buf_[180] = {};  // オペランド、FMOVEM のデータ、状態のフレーム
+#endif
 };
 
 } // namespace x68k

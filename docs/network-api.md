@@ -24,7 +24,7 @@ HTTP (80 番) のサーバと syslog の送信を行う。既定では動かさ�
 
 `net_token=` を書くと、ファイルを読む (`GET /files/...`) のにもトークンが要る。トークンは `pix68k.cfg` か `cmdline.txt` に書いてあり、
 読めればそのまま書き込みと再起動に使えるため。その写し (`.new`、`.part`、`.old` や手で作った控え) もあるので、名前で選ばずに
-ファイルはすべてトークンを求める。`/log`、`/thermal`、`/screen.ppm` はトークンなしで読める (`net_allow=` の制限は受ける)。
+ファイルはすべてトークンを求める。`/log`、`/thermal`、`/screen.ppm`、`/ts6bga.ppm`、`/screen2.ppm` はトークンなしで読める (`net_allow=` の制限は受ける)。
 
 HTTP の口:
 
@@ -37,6 +37,8 @@ HTTP の口:
 | `GET /log` | 起動してからのログ (UART と同じもの。最新の 64KB) |
 | `GET /thermal` | 温度、ARM のクロック、ファームウェアがクロックを下げているか、ファン (Pi 5)。`名前=値` を 1 行ずつ返す (下に詳しく書いた) |
 | `GET /screen.ppm` | X68000 の画面 (PPM)。X68000 が動いていれば、次に合成し終えたフレームを待って返す (下に詳しく書いた) |
+| `GET /ts6bga.ppm` | TS-6BGA の仮想VRAM (PPM)。表示選択に関係なく、最新のスナップショットを元解像度・RGBで返す。ボード無効・未受信時は503 |
+| `GET /screen2.ppm` | 第2 HDMI で選択中の映像ソース (PPM)。TS-6BGA 選択中はそのVRAM、通常時はフィルター前のX68000画面。HDMIへの拡大縮小・余白・OSDは含めない。ボード無効時は503 |
 | `POST /reboot` | ディスクと SRAM を書いてから再起動する (トークンが要る。Ctrl + Alt + Delete と同じ手順。書けなければ断り、60 秒以内にもう一度頼むと書かずに再起動する) |
 | `POST /reboot?profile=<名前>` | `/pix68k/pix68k-<名前>.cfg` の起動の組み合わせで再起動する (トークンが要る。手順は `POST /reboot` と同じ)。`pix68k.cfg` は書き換えない。次の起動はメニューを出さない。`profile=` が空なら組み合わせなし (`pix68k.cfg` だけ)。名前が正しくなければ 400、ファイルがなければ 404、`/pix68k/profile.sel` に書けなければ 500、起動したドライブがなければ 503 を返し、再起動しない。組み合わせのファイルの数が一覧の上限 (30) を超えていても、ファイルがあれば使う。起動時のメニューを出している間は、HTTP のサーバはまだ動いていない (メニューが終わってから待ち受ける)。受け付けたあとディスクを書き戻せずに再起動を断ったときは、`profile.sel` を前回の選択に戻す。戻せなかったときは、次の `profile=` なしの `POST /reboot` (Ctrl + Alt + Delete と設定メニューの Restart の前にも) でもう一度戻し、それでも戻せなければ 500 を返して再起動しない (SD カードに書けない間は、60 秒以内の 2 回目で書かずに再起動する手順も使えない)。選んだものは前回の選択 (`/pix68k/profile.sel`) にもなる ([README](../README.md) の「起動の組み合わせ」) |
 | `POST /type` | リクエストの本体 (ボディ) の文字列を X68000 のキーとして打つ (トークンが要る。JIS 配列。押してから 40ms で離し、40ms 空けて次を打つ。`\n` は Enter、`\t` は TAB、`\b` は BS、`\e` は ESC。4096 バイトまで) |
@@ -57,6 +59,8 @@ curl -H 'X-Pix68k-Token: 好きな文字列' --data-binary @pix68k.cfg http://pi
 curl http://pix68k/log
 curl http://pix68k/thermal
 curl -o screen.ppm http://pix68k/screen.ppm
+curl -o ts6bga.ppm http://pix68k/ts6bga.ppm
+curl -o screen2.ppm http://pix68k/screen2.ppm
 # キー入力 (X68000 のリセット、CTRL + OPT.1 + DEL は Ctrl + GUI + Delete)
 curl -H 'X-Pix68k-Token: 好きな文字列' --data 'dir\n' http://pix68k/type
 curl -H 'X-Pix68k-Token: 好きな文字列' -X POST 'http://pix68k/key?down=4c&mod=09'

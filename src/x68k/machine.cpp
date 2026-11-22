@@ -223,6 +223,7 @@ Machine::~Machine() {
     delete[] scsiExRom_;
     for (FpuBoard* b : fpuBoards_) delete b;
     delete mercury_;
+    delete ts6bga_;
     delete neptune_;
     delete midi_;
     delete video_;
@@ -495,6 +496,9 @@ bool Machine::setScsiRom(const uint8_t* data, size_t size) {
 }
 
 bool Machine::setFpuBoards(int count) {
+#ifdef PIX68K_NO_FPU_BOARD
+    return count == 0;
+#else
     if (count < 0 || count > FpuBoard::MAX_BOARDS) return false;
     bool ok = true;
     for (int i = 0; i < FpuBoard::MAX_BOARDS; i++) {
@@ -507,6 +511,7 @@ bool Machine::setFpuBoards(int count) {
         }
     }
     return ok;
+#endif
 }
 
 bool Machine::setMercury(bool on) {
@@ -600,9 +605,12 @@ void Machine::resetDevices() {
     sasi_.reset(); // SASI はバスフリーに戻り、割り込みの要求も消える
     spc_.reset();  // 内蔵 SCSI の SPC (ROM がなくても状態はそろえておく)
     spcEx_.reset();
+#ifndef PIX68K_NO_FPU_BOARD
     for (FpuBoard* b : fpuBoards_)
         if (b) b->reset();
+#endif
     if (mercury_) mercury_->reset(); // 記録の読み手は J_RESET で同じことをする
+    if (ts6bga_) ts6bga_->reset();
     if (neptune_) neptune_->reset(); // 拡張スロットのリセットで DP8390 もリセットされる
     if (midi_) {
         // 拡張スロットのリセットで YM3802 もリセットされるとした。外の音源はリセットされないが、鳴ったままの音が
@@ -853,7 +861,16 @@ void Machine::advanceDevices(uint64_t now) {
         uint32_t clocks4M;
         if (mfpAcc_ <= UINT32_MAX) {
             const uint32_t acc = (uint32_t)mfpAcc_;
+#if defined(__arm__) && !defined(__ARM_FEATURE_IDIV)
+            // Cortex-A9 has no integer divide instruction. The 68000's
+            // 16/10MHz ratios use 4/5 here; constant divisors compile to a
+            // shift or multiply instead of a software divide on every sync.
+            if (mfpDiv_ == 4) clocks4M = acc / 4;
+            else if (mfpDiv_ == 5) clocks4M = acc / 5;
+            else clocks4M = acc / mfpDiv_;
+#else
             clocks4M = acc / mfpDiv_;
+#endif
             mfpAcc_ = acc - clocks4M * mfpDiv_;
         } else {
             clocks4M = (uint32_t)(mfpAcc_ / mfpDiv_);
@@ -1293,6 +1310,14 @@ int Machine::interruptAck(int level) {
 
 // ---------------------------------------------------------------- メモリマップ
 
+bool Machine::setTs6bga(bool on, uint32_t base) {
+    if (on && base != 0xee0000 && base != 0xef0000) return false;
+    if (on && ts6bga_) return ts6bga_->window(base);
+    if (on) ts6bga_ = new Ts6bga(base);
+    if (!on) { delete ts6bga_; ts6bga_ = nullptr; }
+    return !on || ts6bga_ != nullptr;
+}
+
 bool Machine::userBlocked(uint32_t addr, int fc) const {
     if (fc != m68k::FC_USER_DATA && fc != m68k::FC_USER_PROG) return false;
     // エリアセット ($E86001) で決めた RAM の先頭と、I/O 領域はスーパーバイザ専用
@@ -1411,11 +1436,23 @@ int Machine::ioRead(uint32_t addr) {
 // machine_bench が遅くなった (コードの配置のため) ので、別の関数にして呼ぶ回数の少ない側に置く
 __attribute__((noinline, cold)) int Machine::boardRead(uint32_t addr) {
     const uint32_t off = addr & 0x1fff;
+    if (ts6bga_) {
+        if (ts6bga_->window(addr)) return ts6bga_->memoryRead(addr & 0xffff);
+        if (addr >= 0xe9e200 && addr < 0xe9e400) {
+            const uint64_t phase = cycles() % config_.cpuHz;
+            const int v = ts6bga_->read(off, (phase * 60 % config_.cpuHz) >= config_.cpuHz * 9 / 10);
+            return v < 0 ? BUS_ERROR : v;
+        }
+    }
     switch ((addr - 0xe80000) >> 13) {
     case 15: { // $E9E000-$E9E01F、$E9E080-$E9E09F: 数値演算プロセッサボード (16 ビットの読み書きは read16() で受ける)
         FpuBoard* b = fpuBoardAt(off);
         if (!b) return BUS_ERROR;
+#ifndef PIX68K_NO_FPU_BOARD
         return b->read8(off & (FpuBoard::SIZE - 1));
+#else
+        return BUS_ERROR;
+#endif
     }
     case 23: { // $EAE000-$EAFFFF: MIDI ボード ($EAFA00-$EAFA0F だけ)
         if (!midi_ || off < (Ym3802::BASE & 0x1fff) || off >= (Ym3802::BASE & 0x1fff) + Ym3802::SIZE) return BUS_ERROR;
@@ -1443,12 +1480,20 @@ __attribute__((noinline, cold)) int Machine::boardRead(uint32_t addr) {
 
 __attribute__((noinline, cold)) bool Machine::boardWrite(uint32_t addr, uint8_t v) {
     const uint32_t off = addr & 0x1fff;
+    if (ts6bga_) {
+        if (ts6bga_->window(addr)) { ts6bga_->memoryWrite(addr & 0xffff, v); return true; }
+        if (addr >= 0xe9e200 && addr < 0xe9e400) return ts6bga_->write(off, v);
+    }
     switch ((addr - 0xe80000) >> 13) {
     case 15: {
         FpuBoard* b = fpuBoardAt(off);
         if (!b) return false;
+#ifndef PIX68K_NO_FPU_BOARD
         b->write8(off & (FpuBoard::SIZE - 1), v);
         return true;
+#else
+        return false;
+#endif
     }
     case 23:
         if (!midi_ || off < (Ym3802::BASE & 0x1fff) || off >= (Ym3802::BASE & 0x1fff) + Ym3802::SIZE) return false;
@@ -1626,10 +1671,12 @@ uint16_t Machine::read16(uint32_t full, int fc) {
     }
     // 数値演算プロセッサボードの CIR は 16 ビットで 1 回の読み書き (応答やオペランドは読むと進む)。
     // $E9E000-$E9E01F と $E9E080-$E9E09F を 1 回の比較で拾い、bit7 でボードを選ぶ
+#ifndef PIX68K_NO_FPU_BOARD
     if ((addr & ~(FPU_BOARD_SELECT | (FpuBoard::SIZE - 1))) == FpuBoard::BASE) {
         FpuBoard* b = fpuBoards_[(addr & FPU_BOARD_SELECT) ? 1 : 0];
         if (b && !userBlocked(addr, fc)) return b->read16(addr & (FpuBoard::SIZE - 1));
     }
+#endif
     int hi = readByte(addr, fc);
     if (hi == BUS_ERROR) busError(full, false, fc);
     int lo = readByte(addr + 1, fc);
@@ -1650,6 +1697,7 @@ void Machine::write16(uint32_t full, uint16_t value, int fc) {
         return;
     }
     busWait(addr, true);
+#ifndef PIX68K_NO_FPU_BOARD
     if ((addr & ~(FPU_BOARD_SELECT | (FpuBoard::SIZE - 1))) == FpuBoard::BASE) {
         FpuBoard* b = fpuBoards_[(addr & FPU_BOARD_SELECT) ? 1 : 0];
         if (b && !userBlocked(addr, fc)) {
@@ -1657,6 +1705,7 @@ void Machine::write16(uint32_t full, uint16_t value, int fc) {
             return;
         }
     }
+#endif
     // 上位バイトの書き込みでバスエラーになれば、下位バイトは書かない
     if (!writeByte(addr, (uint8_t)(value >> 8), fc)) busError(full, true, fc);
     if (!writeByte(addr + 1, (uint8_t)value, fc)) busError(full, true, fc);

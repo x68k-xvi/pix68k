@@ -55,7 +55,9 @@ void CKernel::ServiceMenu() {
     }
     // ↑↓←→ を押し続けたら繰り返す
     if (m_Menu.isOpen()) {
-        const u8 held = platform::MenuKeyRepeat::repeats(m_MenuLastKey) && m_MenuKeys.isHeld(m_MenuLastKey)
+        const u8 held = platform::MenuKeyRepeat::repeats(m_MenuLastKey) &&
+                                (m_MenuKeys.isHeld(m_MenuLastKey) || m_PadMenu[0].holds(m_MenuLastKey) ||
+                                 m_PadMenu[1].holds(m_MenuLastKey))
                             ? m_MenuLastKey
                             : 0;
         if (const u8 r = m_MenuRepeat.update(held, (uint32_t)(CTimer::GetClockTicks64() / (CLOCKHZ / 1000)))) {
@@ -68,6 +70,14 @@ void CKernel::ServiceMenu() {
         return;
     }
     if (redraw) DrawMenu();
+}
+
+// メニューを閉じた (割り込みを止めて呼ぶ)。ゲームパッドで押したままのボタンと方向は、一度離すまで X68000 に送らない
+void CKernel::ClosedPadMenu() {
+    for (int s = 0; s < 2; s++) {
+        m_PadMenu[s].closed();
+        m_PadWant[s] = 0;
+    }
 }
 
 void CKernel::OpenMenu() {
@@ -92,6 +102,7 @@ void CKernel::OpenMenu() {
             m_Logger.Write(FromMenu, LogWarning, "input queue stays full; menu not opened");
             EnterCritical();
             m_MenuKeys.closed(m_LastMods);
+            ClosedPadMenu();
             m_MenuKeyHead = m_MenuKeyTail = 0;
             m_MenuActive = false;
             LeaveCritical();
@@ -109,6 +120,7 @@ void CKernel::OpenMenu() {
             emu->requestPause(false);
             EnterCritical();
             m_MenuKeys.closed(m_LastMods);
+            ClosedPadMenu();
             m_MenuActive = false;
             LeaveCritical();
             return;
@@ -144,6 +156,7 @@ void CKernel::CloseMenu() {
     if (m_pLastFrame != nullptr) ShowFrame(*m_pLastFrame, m_pEmulator->paused());
     EnterCritical();
     m_MenuKeys.closed(m_LastMods);
+    ClosedPadMenu();
     m_MenuKeyHead = m_MenuKeyTail = 0;
     m_MenuActive = false;
     LeaveCritical();
@@ -175,7 +188,10 @@ void CKernel::DrawMenu() {
                               m_ShownScale, 0xff000000u);
     m_OsdState.invalidate(); // 画面の隅の数字も消えた (閉じたあとに描き直す)
     m_MsgState.invalidate(); // 左上のメッセージも同じ
-    m_Menu.draw(base, (int)(fb->GetPitch() / 4), (int)m_Screen.GetWidth(), (int)m_Screen.GetHeight(), 0xff000000u);
+    // 日本語のファイル名は CGROM の字で描く
+    const uint8_t* cg = m_pEmulator != nullptr ? m_pEmulator->cgRom() : nullptr;
+    m_Menu.draw(base, (int)(fb->GetPitch() / 4), (int)m_Screen.GetWidth(), (int)m_Screen.GetHeight(), 0xff000000u, cg,
+                cg != nullptr ? x68k::Machine::CG_SIZE : 0);
     // X68000 の画面の上にメニューを描いたので、次に写すときはすべての行を写す
     m_RowCache.valid = false;
 }

@@ -297,7 +297,7 @@ private:
     platform::ImageCheck TouchesImage(const char* path, bool upload);
     bool RefuseImage(const char* path, bool upload);
     void GetLog(bool head);
-    void GetScreen(bool head);
+    void GetScreen(bool head, unsigned source = 0);
     void Type();
     void Key();
     void Message();
@@ -317,6 +317,7 @@ private:
     u8* m_pBuf = nullptr;     // BUF_SIZE
     char* m_pLog = nullptr;   // CLogRing::SIZE (/log)
     u8* m_pScreen = nullptr;  // 画面の写し (/screen.ppm。初めて頼まれたときに確保する)
+    unsigned m_ScreenCapacity = 0;
     char* m_pType = nullptr;  // MAX_TYPE + 1 (/type)
     unsigned m_nLeft = 0;     // m_pBuf の先頭に残っている本体のバイト数 (頭と一緒に届いた分)
     int m_Status = 0;
@@ -492,6 +493,9 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
         SendText(200, text);
     } else if (strcmp(p, "/screen.ppm") == 0 && (m == M::GET || m == M::HEAD)) {
         GetScreen(m == M::HEAD);
+    } else if ((strcmp(p, "/ts6bga.ppm") == 0 || strcmp(p, "/screen2.ppm") == 0) &&
+               (m == M::GET || m == M::HEAD)) {
+        GetScreen(m == M::HEAD, strcmp(p, "/ts6bga.ppm") == 0 ? 1 : 2);
     } else if (strcmp(p, "/reboot") == 0 && m == M::POST) {
         // ?profile=名前 なら、次の起動をその組み合わせ (pix68k-<名前>.cfg) にする (platform/boot_profile.h)
         char profile[64];
@@ -534,6 +538,8 @@ void CHttpTask::Handle(CSocket* c, const u8 ip[4]) {
                       "GET  /log             log since boot (last 64KB)\n"
                       "GET  /thermal         temperature, ARM clock, throttling and the fan (Pi 5)\n"
                       "GET  /screen.ppm      the X68000 screen\n"
+                      "GET  /ts6bga.ppm      the TS-6BGA framebuffer (unscaled)\n"
+                      "GET  /screen2.ppm     selected HDMI 2 source (unfiltered, unscaled)\n"
                       "POST /reboot          write back disks and SRAM, then reboot\n"
                       "POST /reboot?profile=NAME   reboot with /pix68k/pix68k-NAME.cfg (empty: pix68k.cfg only)\n"
                       "POST /type            type the body as X68000 keys (\\n is Enter)\n"
@@ -915,10 +921,19 @@ void CHttpTask::GetLog(bool head) {
     if (SendHead(200, "text/plain; charset=utf-8", n) && !head && n > 0) SendAll(m_pLog, n);
 }
 
-void CHttpTask::GetScreen(bool head) {
-    if (m_pScreen == nullptr) m_pScreen = new u8[kScreenBytes];
+void CHttpTask::GetScreen(bool head, unsigned source) {
+    const unsigned capacity = source ? 2048u * 1024u * 3u : kScreenBytes;
+    if (m_ScreenCapacity < capacity) {
+        u8* replacement = new u8[capacity];
+        if (replacement) {
+            delete[] m_pScreen; m_pScreen = replacement; m_ScreenCapacity = capacity;
+        }
+    }
     int w = 0, h = 0;
-    if (m_pScreen == nullptr || !m_Env.netSnapshotScreen(m_pScreen, kScreenBytes, w, h)) {
+    const bool ok = m_pScreen && (source
+        ? m_Env.netSnapshotTs6bga(m_pScreen, m_ScreenCapacity, w, h, source == 2)
+        : m_Env.netSnapshotScreen(m_pScreen, m_ScreenCapacity, w, h));
+    if (!ok) {
         SendText(503, "no screen yet\n");
         return;
     }

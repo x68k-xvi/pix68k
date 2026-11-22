@@ -48,6 +48,10 @@
 #include "platform/sample_clock.h"
 #include "platform/uart_midi.h"
 #include "x68k/sram_file.h"
+
+namespace platform {
+class Mt32Synth; // platform/mt32_synth.h (machine_run.cpp が読む)
+}
 #if RASPPI >= 5
 #include <nvme/nvme.h>
 #endif
@@ -178,6 +182,7 @@ private:
     void CloseDiskFiles();
     void SetupFastSeek(FIL* f, const char* label);
     void ReportDisks();
+    void ReportSoundLevels(); // 音の大きさと、MT-32 の音源が捨てたメッセージの数 (machine_run.cpp)
     // 起動の時間 (LogBootTime())。段階の番号は時刻を入れる m_BootTicks の添字
     enum BootStage {
         BootKernel,     // カーネルに入った (CKernel のコンストラクタ)
@@ -328,6 +333,8 @@ private:
     void netEndHeavy() override;
     void netIdleUntil(u64 deadline) override { IdleUntil(deadline); }
     bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) override;
+    bool netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) override;
+    void ShowTsFrame();
     void netRequestReboot() override;
     platform::ProfileRequest netBootProfile(const char* name) override;
     bool netKeyReport(u8 modifiers, const u8 keys[6]) override;
@@ -373,6 +380,8 @@ private:
     void ExpireOsd();
     void ServiceMessage();
     void SendGamePad(int slot);
+    void ResetFromGamePad();
+    void ClosedPadMenu();
     void UpdateKeyboardLeds();
     void ReportMouse();
     void UpdateUsbDevices();
@@ -393,6 +402,10 @@ private:
     CKernelOptions m_Options;
     CDeviceNameService m_DeviceNameService;
     CScreenDevice m_Screen;
+    CBcmFrameBuffer* m_TsDisplay = nullptr;
+    const x68k::Ts6bga* m_TsFrame = nullptr; // 次に takeTs6bga() するまで読み手が所有
+    uint32_t m_TsMainShown = ~0u;
+    bool m_TsChanged = false;
     CSerialDevice m_Serial;
     CTeeDevice m_Tee;
     CExceptionHandler m_ExceptionHandler;
@@ -437,10 +450,16 @@ private:
     CUSBGamePadDevice* volatile m_pGamePad[2] = {nullptr, nullptr};
     unsigned m_PadIndex[2] = {0, 0};     // 状態の通知の nDeviceIndex (upadN の N - 1)
     bool m_PadKnown[2] = {false, false}; // Circle が配置を知っているゲームパッドか
+    const platform::PadLayout* m_PadLayout[2] = {nullptr, nullptr}; // VID:PID で並びの分かるゲームパッド (platform::findPadLayout())
+    int m_LastPadHat[2] = {-2, -2};      // pad_log=on: 前にログに出したハットの生の値
+    bool m_PadLog = false;               // pix68k.cfg の pad_log=
     unsigned m_LastPadButtons[2] = {0, 0};
     u8 m_PadWant[2] = {0, 0};            // ゲームパッドのジョイスティックのビット
     int m_PadSent[2] = {0, 0};           // コア 1 に送ったビット (-1 はまだ送っていない)
     platform::HatDecoder m_PadHat[2];    // ハットの値の直し方 (論理範囲が 0-7 か 1-8 か)
+    platform::PadResetCombo m_PadReset[2]; // Start + Select (X68000 のリセット) を見つける
+    platform::PadMenuInput m_PadMenu[2]; // Home か Select + 上で設定メニューを開き、メニューのキーに置き換える
+    bool m_PadResetRequested = false;    // Start + Select を押した (USB の割り込みが立て、コア 0 の主ループが受け取る)
     bool m_FrameTimingPending = false;   // フレームの時間の区間を頼んで、まだ受け取っていない
     int m_HatBase = -1;                  // pix68k.cfg の hat=: 0 (0-7)、1 (1-8)、-1 (auto)
 
@@ -450,6 +469,8 @@ private:
     NetSerialLink* m_pSerialLink = nullptr; // RS-232C の相手 (rs232c=tcp:PORT のときだけ。host_net.cpp の CSerialTask)
     x68k::MidiOut* m_pMidiOut = nullptr; // MIDI ボードの音源 (midi=on のときだけ。SoundFont、MT-32 か UART)
     CUartMidiOut* m_pUartMidi = nullptr; // midi_out=uart のときの m_pMidiOut
+    platform::Mt32Synth* m_pMt32 = nullptr; // midi_out=mt32 のときの m_pMidiOut (捨てたメッセージの数をログに出す)
+    uint32_t m_Mt32DroppedLogged[2] = {0, 0}; // ログに出したときの droppedMessages() と droppedSysex()
     CSerialDevice* m_pMidiSerial = nullptr; // midi_out=uart で、ログと別の UART を使うとき
     unsigned m_UartMidiDevice = 0;          // midi_out=uart で使う UART (CSerialDevice の番号)
     CString m_MidiSf2Path;               // X68000 を動かし始めてから読む SoundFont (空なら読まない)

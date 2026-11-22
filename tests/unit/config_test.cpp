@@ -158,6 +158,9 @@ void testSettings() {
     CHECK_EQ(s.keyboard, 2);
     CHECK_EQ((int)applySetting(s, "hat", "1"), (int)SettingResult::OK);
     CHECK_EQ(s.hat, 1);
+    CHECK_EQ(s.padLog, 0);
+    CHECK_EQ((int)applySetting(s, "pad_log", "on"), (int)SettingResult::OK);
+    CHECK_EQ(s.padLog, 1);
     CHECK_EQ((int)applySetting(s, "sram_memsize", "keep"), (int)SettingResult::OK);
     CHECK_EQ(s.fixSramMemsize, 0);
     // video_scale= と video_filter= (画面の出し方)

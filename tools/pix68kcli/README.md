@@ -28,10 +28,11 @@ macOS と Linux (arm64、x86-64) では、Homebrew で入れられる (Releases 
 brew install j3tm0t0/tap/pix68kcli
 ```
 
-Releases から直接落とした場合は、実行の許可が付いていないので、macOS と Linux では `chmod +x pix68kcli-*` をしてから使う。macOS では、署名していないので `xattr -d com.apple.quarantine pix68kcli-*` も要る。
+Releases から直接落とした場合は、実行の許可が付いていないので、macOS と Linux では `chmod +x pix68kcli-*` をしてから使う。macOS では、ブラウザなどで落としてファイルに quarantine の属性 (`com.apple.quarantine`) が付いた場合、署名していないので開けない。そのときは `xattr -d com.apple.quarantine pix68kcli-*` で外す (curl で落としたものには付かない)。
 
 macOS は、Apple 以外のプログラムが LAN の機械につなぐのを「ローカルネットワーク」の許可で制限する (Homebrew で入れても同じ)。許可がないと、curl では届くのに
-`no route to host` で失敗する (Homebrew の python も同じだった)。システム設定 > プライバシーとセキュリティ > ローカルネットワーク で、
+`no route to host` で失敗する (Homebrew の python も同じだった。`brew install j3tm0t0/tap/pix68kcli` で入れた v0.2.0 でも、許可のないアプリから動かすと、
+curl は 200 を返す同じ宛先に `pix68kcli status` が `connect: no route to host` になった)。システム設定 > プライバシーとセキュリティ > ローカルネットワーク で、
 pix68kcli を動かすターミナルのアプリを許可する。
 
 ## 宛先と token

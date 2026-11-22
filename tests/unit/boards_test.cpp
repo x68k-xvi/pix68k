@@ -1120,7 +1120,7 @@ void testBoardState() {
     CHECK_EQ(x68k::loadState(c, buf, n2, err), false);
     buf[8] = 16; // 版 16 の並びでもない
     CHECK_EQ(x68k::loadState(c, buf, n2, err), false);
-    buf[8] = 17; // 知らない版
+    buf[8] = x68k::STATE_VERSION + 1; // 知らない版
     CHECK_EQ(x68k::loadState(c, buf, n2, err), false);
     CHECK_EQ(strcmp(err, "unsupported state version"), 0);
     buf[8] = 2;
@@ -1192,7 +1192,7 @@ void testBoardState() {
     CHECK_EQ(x68k::loadState(c, buf, n15, err), true);
     size_t n16 = 0;
     CHECK_EQ(x68k::saveState(c, buf, sizeof buf, n16), true);
-    CHECK_EQ(buf[8], 16);
+    CHECK_EQ(buf[8], x68k::STATE_VERSION);
     CHECK_EQ(n16, n15); // 版 16 で増えたのは 2 枚目の数値演算プロセッサボードだけ (なければ同じ並び)
     CHECK_EQ(x68k::loadState(c, buf, n16, err), true);
 }
@@ -1220,7 +1220,7 @@ void testSecondBoardState() {
     CHECK_EQ(resp0 != resp1, true);
     size_t n = 0;
     CHECK_EQ(x68k::saveState(a, buf, sizeof buf, n), true);
-    CHECK_EQ(buf[8], 16);
+    CHECK_EQ(buf[8], x68k::STATE_VERSION);
     CHECK_EQ(buf[60], 1 | 16); // 1 枚目 (bit0) と 2 枚目 (bit4)
     // 版 15 までの並びには 2 枚目のボードがないので、その版では書かない
     size_t n15 = 0;

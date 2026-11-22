@@ -9,6 +9,8 @@
 //              PUT  /files/<パス>        ファイルを書き換える (POST も同じ。<パス>.part に書き終えてから置き換える。
 //                                        platform/net_files.h)。X68000 が使っているディスクのイメージは断る (409)
 //              GET  /log                 起動からのログ (最新 64KB。UART と同じ内容)
+//              GET  /ts6bga.ppm         TS-6BGA の仮想VRAM (PPM)
+//              GET  /screen2.ppm        第2 HDMI の選択中ソース (PPM)
 //              GET  /screen.ppm          いま出している X68000 の画面 (PPM)
 //              POST /reboot              ディスクと SRAM を書き戻してから再起動する
 //              POST /reboot?profile=名前  起動の組み合わせ pix68k-<名前>.cfg で再起動する (空なら pix68k.cfg だけ)
@@ -87,6 +89,7 @@ public:
     virtual void netEndHeavy() = 0;                         // その後
     virtual void netIdleUntil(u64 deadline) = 0;            // 時刻 deadline (CTimer::GetClockTicks64()) まで眠る
     virtual bool netSnapshotScreen(u8* rgb, unsigned capacity, int& width, int& height) = 0;
+    virtual bool netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) = 0;
     virtual void netRequestReboot() = 0;                    // 少し後に再起動する (応答を送り終えるため)
     // 次の再起動で使う起動の組み合わせ (POST /reboot?profile=。空なら pix68k.cfg だけ)。名前とファイルを確かめ、
     // profile.sel に書く。nullptr なら前に頼まれたものを取り消す

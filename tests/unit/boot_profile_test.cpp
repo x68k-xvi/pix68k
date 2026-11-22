@@ -73,6 +73,98 @@ void testTitle() {
     CHECK_EQ(strlen(tiny), 3u); // 「あ」1 字 (3 バイト)
 }
 
+// Shift_JIS の題 (#272)。期待する区点は Python の cp932 と euc_jp で確かめた値
+void testTitleSjis() {
+    char t[PROFILE_TITLE_MAX + 1];
+    bool sjis = true;
+    // UTF-8 と ASCII だけの行は UTF-8
+    const char* u = "# グラディウス II\n";
+    CHECK_EQ(profileTitle(u, strlen(u), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 0);
+    sjis = true;
+    CHECK_EQ(profileTitle("# OutRun\n", 9, t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 0);
+    // Shift_JIS: 「グラディウス II」(全角カタカナと ASCII)
+    const char* s = "# \x83\x4f\x83\x89\x83\x66\x83\x42\x83\x45\x83\x58 II \r\nfd0 = GR2.XDF\r\n";
+    CHECK_EQ(profileTitle(s, strlen(s), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strcmp(t, "\x83\x4f\x83\x89\x83\x66\x83\x42\x83\x45\x83\x58 II"), 0);
+    // 2 バイト目が 0x5C の字 (「表」「ソ」) で行を読み違えない
+    const char* h = "#\x95\x5c\x83\x5c\n";
+    CHECK_EQ(profileTitle(h, strlen(h), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strlen(t), 4u);
+    // 半角カタカナ (ｱｲｳ) は 1 バイト
+    const char* k = "# \xb1\xb2\xb3\n";
+    CHECK_EQ(profileTitle(k, strlen(k), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strcmp(t, "\xb1\xb2\xb3"), 0);
+    // 半角カタカナの並びの一部は正しい UTF-8 にもなるので UTF-8 とみなす (ﾃﾞ = 0xC3 0xDE は違うが、ﾂｰ = 0xC2 0xB0 は U+00B0)
+    const char* amb = "# \xc2\xb0\n";
+    CHECK_EQ(profileTitle(amb, strlen(amb), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 0);
+    // BOM があれば UTF-8 (壊れていても)
+    const char* bom = "\xef\xbb\xbf# \x82\xa0\n";
+    CHECK_EQ(profileTitle(bom, strlen(bom), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 0);
+    // 長い Shift_JIS の題は 2 バイト文字の途中で切らない (ASCII 1 字のあとに「あ」を並べ、120 バイト目が字の途中になる)
+    char longTitle[400] = "# a";
+    for (int i = 0; i < 100; i++) strcat(longTitle, "\x82\xa0");
+    CHECK_EQ(profileTitle(longTitle, strlen(longTitle), t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strlen(t), 119u); // a と「あ」59 字
+    char tiny[5];
+    CHECK_EQ(profileTitle(longTitle, strlen(longTitle), tiny, sizeof tiny, &sjis), 1);
+    CHECK_EQ(strlen(tiny), 3u); // a と「あ」1 字
+    // 1 行目が読む上限 (partial) で切れた UTF-8 は、最後の字が欠けていても UTF-8
+    char cut[64] = "# ";
+    for (int i = 0; i < 5; i++) strcat(cut, "あ");
+    const size_t cutLen = strlen(cut) - 1; // 最後の「あ」の 3 バイト目を落とす
+    CHECK_EQ(profileTitle(cut, cutLen, t, sizeof t, &sjis, true), 1);
+    CHECK_EQ(sjis, 0);
+    // ファイルの終わりで欠けていれば (partial でなければ) UTF-8 ではない
+    CHECK_EQ(profileTitle(cut, cutLen, t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    // 改行のないファイルの終わりの半角カタカナ「ﾂ」(0xC2) は Shift_JIS
+    CHECK_EQ(profileTitle("# \xc2", 3, t, sizeof t, &sjis), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strcmp(t, "\xc2"), 0);
+    // 行が終わっていれば、partial でも欠けた字は UTF-8 ではない
+    char cutLine[64];
+    memcpy(cutLine, cut, cutLen);
+    cutLine[cutLen] = '\n';
+    CHECK_EQ(profileTitle(cutLine, cutLen + 1, t, sizeof t, &sjis, true), 1);
+    CHECK_EQ(sjis, 1);
+    // partial で読む上限まで行が続いていても、欠けた字のあとに空白があれば、その字は UTF-8 の字の途中ではない
+    // (「ﾂ」(0xC2) と空白 509 個で 512 バイト。続きは改行)
+    char spaced[512];
+    memset(spaced, ' ', sizeof spaced);
+    spaced[0] = '#';
+    spaced[2] = '\xc2';
+    CHECK_EQ(profileTitle(spaced, sizeof spaced, t, sizeof t, &sjis, true), 1);
+    CHECK_EQ(sjis, 1);
+    CHECK_EQ(strcmp(t, "\xc2"), 0);
+    // partial でも、続くバイトがどうであっても正しい UTF-8 にならない終わりは Shift_JIS:
+    // 長すぎる形 (C0、C1、E0 80、F0 80)、サロゲート (ED A0)、0x10FFFF より大きい (F4 90、F5)、続きのバイトから始まる (80)
+    static const char* const kBad[] = {"# a\xc0", "# a\xc1", "# a\xe0\x80", "# a\xf0\x80", "# a\xed\xa0",
+                                       "# a\xf4\x90", "# a\xf5", "# a\x80", "# a\xe1\x80\x41"};
+    for (const char* b : kBad) {
+        CHECK_EQ(profileTitle(b, strlen(b), t, sizeof t, &sjis, true), 1);
+        CHECK_EQ(sjis, 1);
+    }
+    // 続くバイト次第で正しい UTF-8 になる終わりは、partial なら UTF-8
+    static const char* const kGood[] = {"# a\xc2", "# a\xe0\xa0", "# a\xed\x9f", "# a\xef\xbf", "# a\xf0\x90\x80",
+                                        "# a\xf4\x8f\xbf", "# a\xe3"};
+    for (const char* g : kGood) {
+        CHECK_EQ(profileTitle(g, strlen(g), t, sizeof t, &sjis, true), 1);
+        CHECK_EQ(sjis, 0);
+    }
+    // 題がなければ sjis は false
+    sjis = true;
+    CHECK_EQ(profileTitle("fd0 = A.XDF\n", 12, t, sizeof t, &sjis), 0);
+    CHECK_EQ(sjis, 0);
+}
+
 // 文字列から ConfigText を作る
 void load(ConfigText& t, const char* s) { t.load(s, strlen(s)); }
 // ConfigText の中身が want と同じか (data() は 0 で終わらない)
@@ -457,6 +549,78 @@ void testLayout() {
     CHECK_EQ(cells[0], 0xb1);
 }
 
+// Shift_JIS の行を並べる (#272)。区点は Python の cp932 と euc_jp で確かめた値
+void testLayoutSjis() {
+    uint16_t cells[32];
+    // ASCII、全角、半角カタカナの混じり: a あ ｱ
+    CHECK_EQ(layoutLine("a\x82\xa0\xb1", cells, 10, true), 4);
+    CHECK_EQ(cells[0], 'a');
+    CHECK_EQ(cells[1], 0x2422);
+    CHECK_EQ(cells[2], MSG_CELL_RIGHT);
+    CHECK_EQ(cells[3], 0xb1);
+    // 区と点の境目: × (817E) ÷ (8180) ◇ (819E) ◆ (819F)
+    CHECK_EQ(layoutLine("\x81\x7e\x81\x80\x81\x9e\x81\x9f", cells, 10, true), 8);
+    CHECK_EQ(cells[0], 0x215f);
+    CHECK_EQ(cells[2], 0x2160);
+    CHECK_EQ(cells[4], 0x217e);
+    CHECK_EQ(cells[6], 0x2221);
+    // 1 バイト目の境目: 檗 (9F40) 滌 (9FFC) 漾 (E040) 熙 (EAA4)
+    CHECK_EQ(layoutLine("\x9f\x40\x9f\xfc\xe0\x40\xea\xa4", cells, 10, true), 8);
+    CHECK_EQ(cells[0], 0x5d21);
+    CHECK_EQ(cells[2], 0x5e7e);
+    CHECK_EQ(cells[4], 0x5f21);
+    CHECK_EQ(cells[6], 0x7426);
+    // 2 バイト目が 0x5C: 表 (955C) ソ (835C)
+    CHECK_EQ(layoutLine("\x95\x5c\x83\x5c", cells, 10, true), 4);
+    CHECK_EQ(cells[0], 0x493d);
+    CHECK_EQ(cells[2], 0x253d);
+    // 壊れたバイト列: 2 バイト目が違う、使わないバイト、終わりで切れた 1 バイト目は「?」で 1 バイトずつ進む
+    CHECK_EQ(layoutLine("\x82" "0\x80\xa0\xfd\x82", cells, 10, true), 6);
+    CHECK_EQ(cells[0], '?');
+    CHECK_EQ(cells[1], '0');
+    CHECK_EQ(cells[2], '?');
+    CHECK_EQ(cells[3], '?');
+    CHECK_EQ(cells[4], '?');
+    CHECK_EQ(cells[5], '?');
+    // 2 バイト目が 0x7F なら 2 バイト文字ではない (「?」で 1 バイト進み、0x7F は捨てる)
+    CHECK_EQ(layoutLine("\x82\x7f" "a", cells, 10, true), 2);
+    CHECK_EQ(cells[0], '?');
+    CHECK_EQ(cells[1], 'a');
+    // 1 バイト目の上限 0xFC (IBM 拡張文字の範囲) も 2 バイト文字として読み、区点は 0x7E 区より先のまま (豆腐になる)
+    CHECK_EQ(layoutLine("\xfc\x40\xfc\xfc", cells, 10, true), 4);
+    CHECK_EQ(cells[0], 0x9721);
+    CHECK_EQ(cells[2], 0x987e);
+    CHECK_EQ(cgromFont16Offset(cells[0]), -1);
+    // 外字 (F040) は区点のまま (CGROM にないので drawCells() が豆腐にする)
+    CHECK_EQ(layoutLine("\xf0\x40", cells, 10, true), 2);
+    CHECK_EQ(cells[0], 0x7f21);
+    // TAB は空白、ほかの制御文字は捨てる
+    CHECK_EQ(layoutLine("a\tb\x01", cells, 10, true), 3);
+    CHECK_EQ(cells[1], ' ');
+    // 入りきらなければ全角の途中で切らずに「…」
+    CHECK_EQ(layoutLine("a\x82\xa0\x82\xa2\x82\xa4\x82\xa6", cells, 6, true), 5);
+    CHECK_EQ(cells[1], 0x2422);
+    CHECK_EQ(cells[3], MSG_JIS_ELLIPSIS);
+    // 同じバイト列でも UTF-8 として読めば違う
+    CHECK_EQ(layoutLine("\x82\xa0", cells, 10), 2);
+    CHECK_EQ(cells[0], '?');
+}
+
+void testMenuSjis() {
+    ProfileList l;
+    CHECK_EQ(l.add("gr2", "\x83\x4f\x83\x89", true), 1);
+    CHECK_EQ(l.add("cbx", "OutRun"), 1);
+    CHECK_EQ(l.add("empty", "", true), 1);
+    CHECK_EQ(l.at(0).sjis, 0);
+    CHECK_EQ(l.at(2).sjis, 1);
+    CHECK_EQ(l.at(1).sjis, 0); // 題が空なら false
+    // Shift_JIS の題の行も描ける (CGROM がないので全角は豆腐)
+    BootMenu m;
+    m.open(&l, 3, 0, 5000);
+    static uint32_t px[640 * 480];
+    m.draw(px, 640, 640, 480, 0, nullptr, 0, 0xff000000u);
+}
+
 void testMenu() {
     ProfileList l;
     l.add("cbx", "OutRun");
@@ -810,6 +974,7 @@ void testPadStart() {
 int main() {
     testNames();
     testTitle();
+    testTitleSjis();
     testMerge();
     testWriteSplit();
     testVideoProfile();
@@ -818,6 +983,8 @@ int main() {
     testChoiceStore();
     testPadStart();
     testLayout();
+    testLayoutSjis();
+    testMenuSjis();
     testMenu();
     testDraw();
     testAutoTyper();

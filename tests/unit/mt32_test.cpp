@@ -10,8 +10,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
 #include <initializer_list>
 #include <new>
+#include <thread>
 #include <vector>
 
 #include "platform/disk_cache_size.h"
@@ -508,6 +510,43 @@ void testRealMismatch(const char* mt32Ctrl, const char* mt32Pcm, const char* cmC
 
 } // namespace
 
+// 捨てた数は、音を作るスレッドが足している間に、ほかのスレッドからログ用に読んでよい (ベアメタル版はコア 0 が読む)。
+// 読んだ値は減らず、終わったあとの数は合っている。-fsanitize=thread でビルドすると、データの競合も調べられる
+void testDroppedFromAnotherThread() {
+    printf("mt32: the dropped counters can be read from another thread\n");
+    Mt32Synth s;
+    CHECK_EQ((int)loadFake(s, 65536, kCtrlMt32_107, 524288, kPcmMt32), (int)Mt32Synth::OK);
+    std::vector<uint8_t> m(Mt32Synth::SYSEX_MAX + 1, 0); // 1 バイト長い
+    m.front() = 0xf0;
+    m.back() = 0xf7;
+    const std::vector<uint8_t> note = {0x91, 0x3c, 0x40};
+    std::atomic<bool> done{false};
+    int backwards = 0;
+    unsigned reads = 0;
+    std::thread reader([&] {
+        uint32_t sysex = 0, messages = 0;
+        while (!done.load(std::memory_order_acquire)) {
+            const uint32_t x = s.droppedSysex(), y = s.droppedMessages();
+            if (x < sysex || y < messages) backwards++;
+            sysex = x;
+            messages = y;
+            reads++;
+        }
+    });
+    const int rounds = 300;
+    for (int i = 0; i < rounds; i++) {
+        for (uint8_t b : m) s.midiByte(b);
+        for (int k = 0; k < 8; k++)
+            for (uint8_t b : note) s.midiByte(b); // 音を作らないので、待ち行列 (1024) があふれて捨てる
+    }
+    done.store(true, std::memory_order_release);
+    reader.join();
+    CHECK_EQ(reads > 0, true);
+    CHECK_EQ(backwards, 0);
+    CHECK_EQ(s.droppedSysex(), (uint32_t)rounds);
+    CHECK_EQ(s.droppedMessages() > 0, true);
+}
+
 int main() {
     testRomChecks();
     testFakeOpen(48000, 65536, kCtrlMt32_107, 524288, kPcmMt32);
@@ -515,6 +554,7 @@ int main() {
     testFakeOpen(44100, 65536, kCtrlMt32_107, 524288, kPcmMt32);
     testFakeOpen(32000, 65536, kCtrlMt32_107, 524288, kPcmMt32);
     testOverflow();
+    testDroppedFromAnotherThread();
     testShadowMt32();
     const char* ctrl = getenv("PIX68K_MT32_CTRL");
     const char* pcm = getenv("PIX68K_MT32_PCM");

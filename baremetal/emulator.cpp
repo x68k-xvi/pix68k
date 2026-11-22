@@ -32,6 +32,7 @@ static void wakeCores() { asm volatile("dsb ish; sev" ::: "memory"); }
 static uint64_t waitClock() { return CTimer::GetClockTicks64(); }
 
 Emulator::~Emulator() {
+    delete[] tsFrames_;
     if (machine_) machine_->setLineListener(nullptr);
     delete liveRenderer_;
     delete shadowRenderer_;
@@ -46,6 +47,18 @@ Emulator::~Emulator() {
     delete[] cg_;
     delete[] sramShadow_;
     delete[] dump_;
+}
+
+bool Emulator::initTs6bga(uint32_t base) {
+    if (!machine_) return false;
+    if (tsFrames_) return machine_->ts6bga() && machine_->ts6bga()->window(base);
+    tsFrames_ = new x68k::Ts6bga[3];
+    if (!tsFrames_ || !machine_->setTs6bga(true, base)) {
+        delete[] tsFrames_; tsFrames_ = nullptr;
+        return false;
+    }
+    handoff_.retainSelfFrames();
+    return true;
 }
 
 bool Emulator::init(const uint8_t* ipl, const uint8_t* cg, int64_t localSeconds, const x68k::Config& config,
@@ -319,6 +332,10 @@ void Emulator::run() {
         m.runFrame(); // 表示期間の終わりで publishFrame() が呼ばれる
         // まとめている音のクロック数を、実時間を待つ前にコア 3 に見せる (待つ間にコア 3 が音を作れるように)
         m.sound().flushJournal();
+        if (tsFrames_ && m.ts6bga()->dirty()) {
+            m.ts6bga()->snapshot(tsFrames_[tsHandoff_.writer()]);
+            tsHandoff_.publish([](unsigned) {}); // コア1は表示を受け持たない
+        }
         __atomic_store_n(&leds_, m.keyboard().leds(), __ATOMIC_RELAXED);
         __atomic_store_n(&mousePackets_, m.mouse().packets(), __ATOMIC_RELAXED);
         serviceRequests();

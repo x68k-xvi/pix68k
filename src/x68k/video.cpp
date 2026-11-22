@@ -23,6 +23,7 @@ void Video::reset() {
     memset(sprite_, 0, sizeof sprite_);
     rebuildPaletteTables(); // パレットが全部 0 のときの表にする
     crtcWrites_++;
+    spriteRowsWrites_++;
 }
 
 // パレット ($E82000-$E823FF) とビデオコントローラのレジスタへの書き込み。

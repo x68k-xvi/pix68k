@@ -35,6 +35,7 @@ struct Settings {
     int renderCore = 1;         // render_core= (ベアメタル版だけ)
     int soundCore = 1;          // sound_core= (ベアメタル版だけ)
     int hat = -1;               // hat= (ベアメタル版だけ。-1 auto、0、1)
+    int padLog = 0;             // pad_log= (ベアメタル版だけ。ゲームパッドのボタンとハットの生の値が変わったらログに出す)
     int keyboard = 0;           // keyboard= (ベアメタル版だけ。0 auto、1 usb、2 pi400us、3 pi400jp)
     int fixSramMemsize = 1;     // sram_memsize= (1 fix、0 keep)
     int scsiEx = 0;             // scsi_ex= (外付け SCSI ボード)
@@ -174,6 +175,7 @@ static const SettingKey kSettingKeys[] = {
     {"sound_core",   SettingKey::ONOFF,  PIX68K_OFF(soundCore),       0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"sram_memsize", SettingKey::CHOICE, PIX68K_OFF(fixSramMemsize),  0, 0,   nullptr, settings_detail::kSramChoices, settings_detail::kSramValues,               true,  true},
     {"hat",          SettingKey::CHOICE, PIX68K_OFF(hat),             0, 0,   nullptr, settings_detail::kHatChoices, settings_detail::kHatValues,                 true,  false},
+    {"pad_log",      SettingKey::ONOFF,  PIX68K_OFF(padLog),          0, 1,   nullptr, nullptr, nullptr,                                                          true,  false},
     {"keyboard",     SettingKey::CHOICE, PIX68K_OFF(keyboard),        0, 0,   nullptr, settings_detail::kKeyboardChoices, settings_detail::kKeyboardValues,       true,  false},
     {"scsi_ex",      SettingKey::ONOFF,  PIX68K_OFF(scsiEx),          0, 1,   nullptr, nullptr, nullptr,                                                          true,  true},
     {"scsi_ex_rom",  SettingKey::PATH,   PIX68K_OFF(scsiExRom),       0, 0,   nullptr, nullptr, nullptr,                                                          true,  true},

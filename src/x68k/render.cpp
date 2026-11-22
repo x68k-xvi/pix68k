@@ -118,10 +118,12 @@ namespace {
 enum { STACK_ABOVE, STACK_SPLIT, STACK_BELOW }; // テキストとスプライトが、グラフィックより手前か奥か
 enum { GRAPHIC_NONE = 0, GRAPHIC_CODE = 1, GRAPHIC_WORD = 2 };
 
-constexpr uint64_t kOnes = 0x0101010101010101ull;
+typedef uint8_t Bytes __attribute__((vector_size(8)));
 
 // 2 バイトをビッグエンディアンの 16 ビットとして読む (スプライトのレジスタとデータ)
 inline uint16_t be16(const uint8_t* p) { return (uint16_t)(p[0] << 8 | p[1]); }
+// 8 バイトのどれもが 1
+constexpr uint64_t kOnes = 0x0101010101010101ull;
 // 8 バイトをそのまま 64 ビットとして読み書きする (番地は 8 の倍数でなくてよい)
 inline uint64_t load64(const uint8_t* bytes) {
     uint64_t value;
@@ -173,10 +175,11 @@ inline void wrapRuns(int w, uint32_t start, uint32_t size, F f) {
 // 切り上げた所まで読み書きする
 inline void mergeCodes(uint8_t* dst, const uint8_t* front, const uint8_t* back, int w) {
     for (int x = 0; x < w; x += 8) {
-        uint64_t f = load64(front + x), b = load64(back + x);
-        uint64_t solid = (((f & 0x7f7f7f7f7f7f7f7full) + 0x7f7f7f7f7f7f7f7full) | f) & 0x8080808080808080ull;
-        uint64_t mask = (solid >> 7) * 0xff;
-        store64(dst + x, b ^ ((b ^ f) & mask));
+        Bytes f, b;
+        memcpy(&f, front + x, sizeof f);
+        memcpy(&b, back + x, sizeof b);
+        const Bytes merged = f | (b & ~(Bytes)(f != 0));
+        memcpy(dst + x, &merged, sizeof merged);
     }
 }
 
@@ -202,7 +205,6 @@ void buildTextLine(const Video& v, int y, int w, uint8_t* dst) {
 // GCC / Clang のベクトル型を使う (コンパイラの自動のベクトル化には頼らない。-O2 でも SIMD の命令になる)。
 // f はワード 1 つ (unsigned) にも 8 つ (Words) にも使える式にする
 typedef uint16_t Words __attribute__((vector_size(16)));
-typedef uint8_t Bytes __attribute__((vector_size(8)));
 
 // front が 0 でなければ front、0 なら back
 inline unsigned pick(unsigned front, unsigned back) { return front ? front : back; }
@@ -317,11 +319,14 @@ inline uint64_t spreadPattern(const uint8_t* p) {
 
 // 8 ドットを重ねる。0 のドットは透明。0 でないドットは、色コードの上位 4 ビット (block) を付けて書く
 inline void putPattern(uint8_t* d, uint64_t dots, unsigned block) {
-    uint64_t solid = ((dots + 0x0f0f0f0f0f0f0f0full) >> 4) & kOnes; // 0 でないドットのバイトが 1
-    if (!solid) return;
-    uint64_t code = dots | (solid * (uint64_t)(block << 4));
-    uint64_t keep = ~(solid * 0xff);
-    store64(d, (load64(d) & keep) | code);
+    if (!dots) return;
+    Bytes pixels, previous;
+    memcpy(&pixels, &dots, sizeof pixels);
+    memcpy(&previous, d, sizeof previous);
+    const Bytes mask = (Bytes)(pixels != 0);
+    const Bytes colors = pixels | (uint8_t)(block << 4);
+    const Bytes merged = (colors & mask) | (previous & ~mask);
+    memcpy(d, &merged, sizeof merged);
 }
 
 // 16x16 ドットのパターンの 1 行 (row は 0..15)。左右の 8 ドットずつを返す
@@ -438,16 +443,38 @@ bool Renderer::buildSpriteLine(int y, int w) {
     memset(dst - MARGIN, 0, (size_t)sw + 2 * MARGIN);
 
     // このラインに掛かるスプライトを、番号の小さい順に 32 個まで
-    uint8_t list[128]; // 制限があるときは 32 個まで
+    uint8_t list[32];
     int total = 0;
-    for (int n = 0; n < 128; ++n) {
-        const uint8_t* s = mem + n * 8;
-        unsigned prw = s[7] & 3;
-        if (prw == 0) continue; // 表示しないスプライト
-        int row = line + 16 - (int)(be16(s + 2) & 1023);
-        if (row < 0 || row > 15) continue; // このラインに掛からない
-        if (total == 32) break;
-        list[total++] = (uint8_t)n;
+    if (!spriteRowsValid_ || spriteRowsSeen_ != video_.spriteRowsGeneration()) {
+        if (!spriteRowsValid_) {
+            memset(spriteRows_, 0, sizeof spriteRows_);
+            memset(spriteEnabledSeen_, 0, sizeof spriteEnabledSeen_);
+        }
+        for (unsigned n = 0; n < 128; n++) {
+            const uint8_t* s = mem + n * 8;
+            const bool enabled = (s[7] & 3) != 0;
+            const unsigned y = be16(s + 2) & 1023;
+            const bool moved = spriteYSeen_[n] != y;
+            const uint32_t bit = 1u << (n & 31);
+            if (spriteEnabledSeen_[n] && (!enabled || moved))
+                for (unsigned row = spriteYSeen_[n]; row < spriteYSeen_[n] + 16u; row++) spriteRows_[row][n >> 5] &= ~bit;
+            if (enabled && (!spriteEnabledSeen_[n] || moved))
+                for (unsigned row = y; row < y + 16; row++) spriteRows_[row][n >> 5] |= bit;
+            spriteYSeen_[n] = (uint16_t)y;
+            spriteEnabledSeen_[n] = enabled;
+        }
+        spriteRowsSeen_ = video_.spriteRowsGeneration();
+        spriteRowsValid_ = true;
+    }
+    if (line >= -16 && line < 1024) {
+        for (unsigned word = 0; word < 4 && total < 32; word++) {
+            uint32_t mask = spriteRows_[line + 16][word];
+            while (mask && total < 32) {
+                const unsigned n = word * 32 + __builtin_ctz(mask);
+                mask &= mask - 1;
+                list[total++] = (uint8_t)n;
+            }
+        }
     }
 
     // スプライトどうしは、優先度 (第 4 ワード) によらず、番号の小さいスプライトの不透明なドットが勝つ。優先度は、勝ったドットが
@@ -461,7 +488,7 @@ bool Renderer::buildSpriteLine(int y, int w) {
         uint64_t left, right;
         unsigned block;
         unsigned group; // 0..2 (優先度 1..3)
-    } vis[128];
+    } vis[32];
     int visCount = 0;
     for (int k = 0; k < total; k++) {
         const uint8_t* s = mem + list[k] * 8;
@@ -802,6 +829,7 @@ void Renderer::renderLine(int y) {
     if (!surface_.pixels || y < 0 || y >= smaller(height_, surface_.rows)) return;
     const int w = smaller(width_, surface_.columns);
     if (w <= 0) return;
+    if (indexedSink_) indexedSink_->beginLine(y, w);
     uint32_t* out = surface_.pixels + (size_t)y * (size_t)surface_.pitch;
     const uint16_t r0 = video_.videoControl(0), r1 = video_.videoControl(1), r2 = video_.videoControl(2);
     const uint32_t* xrgb = video_.paletteXrgb();
@@ -852,9 +880,22 @@ void Renderer::renderLine(int y) {
     }
 
     if (graphic == GRAPHIC_NONE) {
+        if (indexedSink_) {
+            const uint8_t* codes = stacking == STACK_ABOVE ? front : back;
+            if (stacking == STACK_SPLIT) {
+                codes = front ? front : back;
+                if (front && back) {
+                    mergeCodes(mergeLine_ + MARGIN, front, back, w);
+                    codes = mergeLine_ + MARGIN;
+                }
+            }
+            if (indexedSink_->above(y, w, codes, nullptr, tlut, nullptr)) return;
+        }
         composeLayers(out, w, stacking, front, back, tlut, [](int) { return (uint32_t)0; });
         return;
     }
+    if (indexedSink_ && !special && graphic == GRAPHIC_CODE && stacking == STACK_ABOVE &&
+        indexedSink_->above(y, w, front, graphicLine_ + MARGIN, tlut, xrgb)) return;
     if (special) {
         const uint8_t* zero = zeroLine_ + MARGIN;
         composeSpecial(w, out, r2, graphic, front ? front : zero, back ? back : zero, stacking);

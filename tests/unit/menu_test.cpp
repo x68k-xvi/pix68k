@@ -1093,6 +1093,141 @@ bool findText(const uint32_t* buf, int w, int h, const char* text, int scale, ui
     return false;
 }
 
+// buf (w x h、下の画面は 0) に描いたメニューの中に、升目 cells (n 桁) を scale 倍、color、cgrom で描いたものがあるか。
+// findText() と同じく、1 行の左から右までが一致する所を探す
+bool findCells(const uint32_t* buf, int w, int h, const uint16_t* cells, int n, int scale, uint32_t color,
+               const uint8_t* cgrom, size_t cgromSize) {
+    const int tw = n * 8 * scale, th = 16 * scale;
+    if (tw > w || th > h) return false;
+    static uint32_t ref[Menu::COLS * 8 * 3 * 16 * 3];
+    for (int i = 0; i < tw * th; i++) ref[i] = 0x101028u;
+    drawCells(ref, tw, tw, th, 0, 0, cells, n, scale, color, cgrom, cgromSize);
+    for (int y = 0; y + th <= h; y++)
+        for (int x = 0; x + tw <= w; x++) {
+            bool same = true;
+            for (int ty = 0; ty < th && same; ty++)
+                same = memcmp(buf + (y + ty) * w + x, ref + ty * tw, (size_t)tw * 4) == 0;
+            if (same) return true;
+        }
+    return false;
+}
+
+// 升目を作る小さな道具: ASCII の文字列、全角の区点 (count 字)、「…」を足す
+struct Cells {
+    uint16_t c[Menu::COLS + 2];
+    int n = 0;
+    Cells& ascii(const char* s) {
+        while (*s) c[n++] = (uint8_t)*s++;
+        return *this;
+    }
+    Cells& wide(uint16_t code, int count = 1) {
+        for (int i = 0; i < count; i++) {
+            c[n++] = code;
+            c[n++] = MSG_CELL_RIGHT;
+        }
+        return *this;
+    }
+};
+
+// 日本語のファイル名 (#275): UTF-8 の名前を切らずに行にし、全角と半角カタカナを CGROM の字で描く。桁があふれたら
+// 最後を「…」にする。CGROM がなければ全角は豆腐、半角カタカナは「?」。NAME バイトに入らない名前は一覧に出さない
+void testJapaneseNames() {
+    printf("japanese names\n");
+    // 「あ」20 字と .XDF (64 バイト。前は 1 行 48 バイトで切れていた。先頭の空白と合わせて 45 桁で入る)、
+    // 「あ」25 字と .XDF (先頭の空白と合わせて 55 桁で、48 桁に入らない)、半角カタカナ、長すぎる名前 (100 バイト)
+    static char kLong[128], kWide[80], kOver[96];
+    kLong[0] = kWide[0] = kOver[0] = 0;
+    for (int i = 0; i < 32; i++) strcat(kLong, "あ");
+    strcat(kLong, ".XDF");
+    for (int i = 0; i < 20; i++) strcat(kWide, "あ");
+    strcat(kWide, ".XDF");
+    for (int i = 0; i < 25; i++) strcat(kOver, "あ");
+    strcat(kOver, ".XDF");
+    static const char kKana[] = "\xef\xbd\xb8\xef\xbe\x9e\xef\xbe\x97.XDF"; // ｸﾞﾗ.XDF
+    struct JaHost : FakeHost {
+        void listFiles(MenuFileKind, MenuFileList& list) override {
+            list.add(kWide);
+            list.add(kOver);
+            list.add(kKana);
+            list.add(kLong);
+        }
+    } host;
+    MenuFileList l;
+    host.listFiles(MenuFileKind::FLOPPY, l);
+    CHECK_EQ(l.count(), 3); // 長すぎる名前は出さない
+    // 95 バイトの名前は出し、96 バイトの名前は出さない
+    char n95[100], n96[100];
+    memset(n95, 'a', 91);
+    memcpy(n95 + 91, ".XDF", 5);
+    memset(n96, 'a', 92);
+    memcpy(n96 + 92, ".XDF", 5);
+    CHECK_EQ(strlen(n95), 95u);
+    MenuFileList edge;
+    edge.add(n95);
+    edge.add(n96);
+    CHECK_EQ(edge.count(), 1);
+    CHECK_EQ(strcmp(edge.name(0), n95), 0);
+    // 日本語の名前は英数字の名前のあとに並ぶ
+    MenuFileList order;
+    order.add(kWide);
+    order.add("ZZZ.XDF");
+    CHECK_EQ(strcmp(order.name(0), "ZZZ.XDF"), 0);
+
+    Menu m(host);
+    Settings s;
+    m.open(s, s);
+    moveTo(m, "FD0");
+    m.key(menu_key::ENTER);
+    CHECK_EQ(m.inFileList(), 1);
+    // 字形を見分けられるようにした CGROM:「あ」(0x2422) は縞、「…」(0x2144) は塗りつぶし、ｸ ﾞ ﾗ は別の縞
+    static uint8_t cg[x68k::Machine::CG_SIZE];
+    memset(cg, 0, sizeof cg);
+    memset(cg + cgromFont16Offset(0x2422), 0xaa, 32);
+    memset(cg + cgromFont16Offset(MSG_JIS_ELLIPSIS), 0xff, 32);
+    static const int kKanaCodes[] = {0xb8, 0xde, 0xd7};
+    for (int k : kKanaCodes) memset(cg + CGROM_FONT8X16 + k * 16, 0x55, 16);
+    static uint32_t buf[768 * 512];
+    memset(buf, 0, sizeof buf);
+    m.draw(buf, 768, 768, 512, 0, cg, sizeof cg);
+    const uint32_t white = 0xffffffu;
+    // 「あ」20 字の行は、最後の .XDF まで 1 行に描かれている
+    Cells wide;
+    wide.ascii(" ").wide(0x2422, 20).ascii(".XDF");
+    CHECK_EQ(findCells(buf, 768, 512, wide.c, wide.n, 1, white, cg, sizeof cg), 1);
+    // 「あ」25 字の行は 48 桁に入らないので、「あ」22 字のあとを「…」にする (全角の途中で切らない)
+    Cells over;
+    over.ascii(" ").wide(0x2422, 22).wide(MSG_JIS_ELLIPSIS);
+    CHECK_EQ(findCells(buf, 768, 512, over.c, over.n, 1, white, cg, sizeof cg), 1);
+    // 半角カタカナの行
+    Cells kana;
+    kana.ascii(" ");
+    kana.c[kana.n++] = 0xb8;
+    kana.c[kana.n++] = 0xde;
+    kana.c[kana.n++] = 0xd7;
+    kana.ascii(".XDF");
+    CHECK_EQ(findCells(buf, 768, 512, kana.c, kana.n, 1, white, cg, sizeof cg), 1);
+
+    // CGROM がなければ、全角は豆腐 (「…」は点 3 つ)、半角カタカナは「?」
+    memset(buf, 0, sizeof buf);
+    m.draw(buf, 768, 768, 512, 0, nullptr, 0);
+    Cells tofu;
+    tofu.ascii(" ").wide(MSG_CELL_TOFU, 20).ascii(".XDF");
+    CHECK_EQ(findCells(buf, 768, 512, tofu.c, tofu.n, 1, white, nullptr, 0), 1);
+    Cells tofuOver;
+    tofuOver.ascii(" ").wide(MSG_CELL_TOFU, 22).wide(MSG_JIS_ELLIPSIS);
+    CHECK_EQ(findCells(buf, 768, 512, tofuOver.c, tofuOver.n, 1, white, nullptr, 0), 1);
+    CHECK_EQ(findText(buf, 768, 512, " ???.XDF", 1, white), 1);
+
+    // 選ぶと、切れていない名前で入れる (一覧は [Eject]、「あ」20 字、「あ」25 字、ｸﾞﾗ.XDF の順)
+    m.key(menu_key::DOWN);
+    m.key(menu_key::ENTER);
+    CHECK_EQ(strcmp(host.disk[0], kWide), 0);
+    m.key(menu_key::ENTER);
+    m.key(menu_key::DOWN); // 今の「あ」20 字から 1 つ下
+    m.key(menu_key::ENTER);
+    CHECK_EQ(strcmp(host.disk[0], kOver), 0);
+}
+
 // 768x512 (ホスト版がメニューを描く大きさ) では、どの項目を選んでいても、下の「*」の説明と状態の行が描かれる。
 // 1920x1080 では文字が 2 倍のまま。68000 / 68030 / 68060 を、Scale の項目のある環境 (ベアメタル版) とない環境
 // (ホスト版) で見る。MIDI board を on にした場合 (前の版では MIDI out の行が増えた) も見る
@@ -1344,6 +1479,7 @@ int main() {
     testDiscardConfirm();
     testNavigate();
     testDisks();
+    testJapaneseNames();
     testActions();
     testKeyFilter();
     testDraw();

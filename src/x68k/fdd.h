@@ -40,6 +40,7 @@ public:
     Format format() const { return format_; }
     bool writeProtected() const { return writeProtect_; }
     bool dirty() const { return dirty_.any(); }
+    uint32_t writeCount() const { return dirty_.writes(); }
     void clearDirty() { dirty_.clearAll(); }
 
     // トラック (シリンダ x 2 + ヘッド) のセクタの数と、i 番目のセクタ (回転の順)

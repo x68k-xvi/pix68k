@@ -20,10 +20,9 @@ endif()
 
 # ベアメタル (Circle) と同じ制約でビルドできることを確かめるため、コアは例外と RTTI なしでビルドする
 # 68030 / 68060 のコア (cpu020.cpp) と FPU (fpu.cpp) も同じライブラリに入れる
-add_library(m68k STATIC src/m68k/m68k.cpp src/m68k/cpu020.cpp src/m68k/fpu.cpp src/m68k/fpu_core.cpp
-  src/m68k/fpu_math.cpp)
-target_include_directories(m68k PUBLIC src)
-target_compile_options(m68k PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+set(PIX68K_BUILD_CPU020 ON)
+set(PIX68K_BUILD_FPU_BOARD ON)
+include(cmake/emulation-core.cmake)
 
 add_executable(sst_runner tests/sst/sst_runner.cpp)
 target_link_libraries(sst_runner m68k)
@@ -113,16 +112,6 @@ add_executable(cpu020_bench tests/bench/cpu020_bench.cpp)
 target_link_libraries(cpu020_bench m68k)
 
 # X68000 本体 (メモリマップと周辺機器)。コアと同じく例外と RTTI なしでビルドする
-add_library(x68k STATIC src/x68k/machine.cpp src/x68k/mfp.cpp src/x68k/rtc.cpp src/x68k/video.cpp src/x68k/devices.cpp
-  src/x68k/gvram.cpp src/x68k/render.cpp
-  src/x68k/fdd.cpp src/x68k/fdc.cpp src/x68k/dmac.cpp src/x68k/keyboard.cpp src/x68k/textscreen.cpp src/x68k/sram_file.cpp
-  src/x68k/scc.cpp src/x68k/mouse.cpp src/x68k/ppi.cpp src/x68k/sasi.cpp src/x68k/spc.cpp src/x68k/cd_drive.cpp
-  src/x68k/opm.cpp src/x68k/adpcm.cpp src/x68k/sound.cpp src/x68k/video_replay.cpp src/x68k/sound_replay.cpp
-  src/x68k/state.cpp src/x68k/fpu_board.cpp src/x68k/mercury.cpp src/x68k/neptune.cpp src/x68k/ym3802.cpp)
-target_include_directories(x68k PUBLIC src)
-# -fcheck-new: new が 0 を返す環境 (Circle) で、確保の失敗を Machine::ok() で返すため
-target_compile_options(x68k PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti -fcheck-new)
-target_link_libraries(x68k m68k)
 
 # MT-32 の音源 Munt (external/munt/mt32emu、LGPL 2.1 以降)。ソースは変えずに静的ライブラリにする。
 # config.h は external/munt/config に手で書いたもの。Munt の中の警告は出さない (Munt のソースは直さない)。
@@ -176,15 +165,16 @@ target_link_libraries(midisynth mt32emu nukedsc55)
 #     -DCMAKE_EXE_LINKER_FLAGS=-fsanitize=address,undefined
 #   cmake --build build/san --target midi_test && build/san/midi_test
 add_executable(midi_test tests/unit/midi_test.cpp)
-target_link_libraries(midi_test x68k midisynth)
+target_link_libraries(midi_test x68k midisynth Threads::Threads)
 target_compile_options(midi_test PRIVATE -Wall -Wextra)
 add_test(NAME midi_test COMMAND midi_test)
 # MT-32 の音源 (Munt)。ROM がなくても通る。本物の ROM で鳴ることも見るときは、環境変数で ROM を渡す:
 #   PIX68K_MT32_CTRL=mt32_ctrl_1_07.rom PIX68K_MT32_PCM=mt32_pcm.rom
 #   PIX68K_CM32L_CTRL=cm32l_ctrl_1_02.rom PIX68K_CM32L_PCM=cm32l_pcm.rom build/mt32_test
-# midi_test と同じく、ASan / UBSan のビルド (上の手順) でも確かめる
+# midi_test と同じく、ASan / UBSan のビルド (上の手順) でも確かめる。midi_test と mt32_test には、ログ用の数をほかのスレッドから
+# 読む試験があるので、-DCMAKE_CXX_FLAGS=-fsanitize=thread のビルドでも確かめる
 add_executable(mt32_test tests/unit/mt32_test.cpp)
-target_link_libraries(mt32_test x68k midisynth)
+target_link_libraries(mt32_test x68k midisynth Threads::Threads)
 target_compile_options(mt32_test PRIVATE -Wall -Wextra)
 add_test(NAME mt32_test COMMAND mt32_test)
 # SC-55mkII の音源 (Nuked-SC55)。ROM がなくても通る。本物の ROM で鳴ることも見るときは、ROM のディレクトリを渡す:
@@ -415,6 +405,38 @@ foreach(t config_test menu_test file_replace_test net_test boot_drive_test boot_
   add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
+# ベアメタル版の FatFs の設定 (tools/ffconf_patch.sh) で、日本語のファイル名を UTF-8 で読み書きできるか。
+# Circle の FatFs をホストで動かす (submodule の external/circle がなければ作らない)
+set(FATFS_DIR ${CMAKE_SOURCE_DIR}/external/circle/addon/fatfs)
+if(EXISTS ${FATFS_DIR}/ff.c)
+  enable_language(C)
+  # ff.h と ff.c は同じディレクトリの ffconf.h を先に読むので、写してから使う (ffconf.h は tests/unit/fatfs_names の
+  # もの。ベアメタル版と同じ設定の ffconf_base.h を読み、ホストで要る所だけ変える)
+  set(FATFS_COPY ${CMAKE_BINARY_DIR}/fatfs_names)
+  set(FATFS_FILES ff.c ff.h ffunicode.c diskio.h)
+  set(FATFS_OUTPUTS ${FATFS_COPY}/ffconf_base.h ${FATFS_COPY}/ffconf.h)
+  set(FATFS_SOURCES)
+  foreach(f ${FATFS_FILES})
+    list(APPEND FATFS_OUTPUTS ${FATFS_COPY}/${f})
+    list(APPEND FATFS_SOURCES ${FATFS_DIR}/${f})
+  endforeach()
+  add_custom_command(OUTPUT ${FATFS_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${FATFS_COPY}
+    COMMAND sh ${CMAKE_SOURCE_DIR}/tools/ffconf_patch.sh ${FATFS_DIR}/ffconf.h ${FATFS_COPY}/ffconf_base.h
+    COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/tests/unit/fatfs_names/ffconf.h ${FATFS_COPY}/ffconf.h
+    COMMAND ${CMAKE_COMMAND} -E chdir ${FATFS_DIR} ${CMAKE_COMMAND} -E copy ${FATFS_FILES} ${FATFS_COPY}
+    DEPENDS ${FATFS_DIR}/ffconf.h ${CMAKE_SOURCE_DIR}/tools/ffconf_patch.sh
+      ${CMAKE_SOURCE_DIR}/tests/unit/fatfs_names/ffconf.h ${FATFS_SOURCES})
+  add_executable(fatfs_names_test tests/unit/fatfs_names_test.cpp ${FATFS_COPY}/ff.c ${FATFS_COPY}/ffunicode.c
+    ${FATFS_COPY}/ffconf.h ${FATFS_COPY}/ffconf_base.h)
+  target_include_directories(fatfs_names_test PRIVATE ${FATFS_COPY} ${CMAKE_SOURCE_DIR}/tests/unit)
+  target_link_libraries(fatfs_names_test x68k)
+  set_source_files_properties(${FATFS_COPY}/ff.c ${FATFS_COPY}/ffunicode.c PROPERTIES COMPILE_OPTIONS "-w")
+  add_test(NAME fatfs_names_test COMMAND fatfs_names_test)
+else()
+  message(WARNING "external/circle がないので fatfs_names_test を作らない (git submodule update --init で取る)")
+endif()
+
 # ディスクのイメージの書き戻し (x68k/dirty_map.h、platform/disk_sync.h)。2 つのスレッドで受け渡しも動かす
 add_executable(disk_sync_test tests/unit/disk_sync_test.cpp)
 target_link_libraries(disk_sync_test x68k Threads::Threads)
@@ -631,6 +653,61 @@ target_compile_options(sound_thread_test PRIVATE -Wall -Wextra -fno-exceptions -
 add_test(NAME sound_thread_test COMMAND sound_thread_test -0 ${HUMAN68K_DISK})
 set_tests_properties(sound_thread_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# RetroArch 用の入口。SDL2 版と独立してビルドできる。
+option(PIX68K_LIBRETRO "libretro コアをビルドする (開発中)" OFF)
+if(PIX68K_LIBRETRO)
+  configure_file(libretro/pix68k_libretro.info pix68k_libretro.info COPYONLY)
+  set_target_properties(m68k x68k PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  add_library(pix68k_libretro SHARED libretro/core.cpp libretro/media.cpp libretro/state.cpp libretro/render_worker.cpp libretro/audio_worker.cpp)
+  target_include_directories(pix68k_libretro PRIVATE external/libretro)
+  target_compile_options(pix68k_libretro PRIVATE -Wall -Wextra -fno-exceptions -fno-rtti)
+  target_link_libraries(pix68k_libretro PRIVATE x68k Threads::Threads)
+  set_target_properties(pix68k_libretro PROPERTIES PREFIX "" CXX_VISIBILITY_PRESET hidden
+    VISIBILITY_INLINES_HIDDEN ON)
+  if(UNIX)
+    add_executable(libretro_audio_worker_test tests/libretro/audio_worker_test.cpp libretro/audio_worker.cpp)
+    target_include_directories(libretro_audio_worker_test PRIVATE libretro tests/unit)
+    target_compile_options(libretro_audio_worker_test PRIVATE -fno-exceptions -fno-rtti)
+    target_link_libraries(libretro_audio_worker_test PRIVATE x68k Threads::Threads)
+    add_test(NAME libretro_audio_worker COMMAND libretro_audio_worker_test)
+    set_tests_properties(libretro_audio_worker PROPERTIES TIMEOUT 30)
+    add_executable(libretro_render_worker_test tests/libretro/render_worker_test.cpp libretro/render_worker.cpp)
+    target_include_directories(libretro_render_worker_test PRIVATE libretro tests/unit)
+    target_compile_options(libretro_render_worker_test PRIVATE -fno-exceptions -fno-rtti)
+    target_link_libraries(libretro_render_worker_test PRIVATE x68k Threads::Threads)
+    add_test(NAME libretro_render_worker COMMAND libretro_render_worker_test)
+    set_tests_properties(libretro_render_worker PROPERTIES TIMEOUT 30)
+    add_executable(libretro_bench tests/bench/libretro_bench.cpp)
+    target_include_directories(libretro_bench PRIVATE external/libretro tests/libretro)
+    target_link_libraries(libretro_bench PRIVATE ${CMAKE_DL_LIBS})
+    target_compile_options(libretro_bench PRIVATE -Wall -Wextra)
+    add_dependencies(libretro_bench pix68k_libretro)
+    add_executable(libretro_media_test tests/libretro/media_test.cpp libretro/media.cpp)
+    target_include_directories(libretro_media_test PRIVATE libretro tests/unit)
+    target_link_libraries(libretro_media_test PRIVATE x68k)
+    target_compile_options(libretro_media_test PRIVATE -Wall -Wextra)
+    add_test(NAME libretro_media COMMAND libretro_media_test)
+    set_tests_properties(libretro_media PROPERTIES TIMEOUT 30)
+    add_executable(libretro_api_test tests/libretro/api_test.cpp)
+    target_include_directories(libretro_api_test PRIVATE external/libretro tests/unit)
+    target_compile_options(libretro_api_test PRIVATE -Wall -Wextra)
+    target_link_libraries(libretro_api_test PRIVATE ${CMAKE_DL_LIBS})
+    add_dependencies(libretro_api_test pix68k_libretro)
+    add_test(NAME libretro_api COMMAND libretro_api_test $<TARGET_FILE:pix68k_libretro>)
+    add_executable(libretro_runtime_test tests/libretro/runtime_test.cpp)
+    target_include_directories(libretro_runtime_test PRIVATE external/libretro tests/unit)
+    target_compile_options(libretro_runtime_test PRIVATE -Wall -Wextra)
+    target_link_libraries(libretro_runtime_test PRIVATE x68k ${CMAKE_DL_LIBS})
+    add_dependencies(libretro_runtime_test pix68k_libretro)
+    add_test(NAME libretro_runtime COMMAND libretro_runtime_test $<TARGET_FILE:pix68k_libretro>)
+    add_test(NAME libretro_human68k COMMAND libretro_runtime_test $<TARGET_FILE:pix68k_libretro>
+      $ENV{HOME}/.cache/pix68k/rom ${HUMAN68K_DISK})
+    set_tests_properties(libretro_api PROPERTIES TIMEOUT 15)
+    set_tests_properties(libretro_runtime PROPERTIES TIMEOUT 30)
+    set_tests_properties(libretro_human68k PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  endif()
+endif()
+
 # ホスト版 (SDL2)。SDL2 がなければ作らない
 option(PIX68K_HOST "SDL2 のホスト版をビルドする" ON)
 if(PIX68K_HOST)
@@ -720,3 +797,13 @@ if(PIX68K_HOST)
     message(STATUS "SDL2 が見つからないので、ホスト版 (pix68k) はビルドしない")
   endif()
 endif()
+
+add_executable(ts6bga_test tests/unit/ts6bga_test.cpp)
+target_link_libraries(ts6bga_test x68k Threads::Threads)
+target_compile_options(ts6bga_test PRIVATE -Wall -Wextra)
+add_test(NAME ts6bga_test COMMAND ts6bga_test)
+
+add_executable(ts6bga_blt_test tests/unit/ts6bga_blt_test.cpp)
+target_link_libraries(ts6bga_blt_test x68k)
+target_compile_options(ts6bga_blt_test PRIVATE -Wall -Wextra)
+add_test(NAME ts6bga_blt_test COMMAND ts6bga_blt_test)

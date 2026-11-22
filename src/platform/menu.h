@@ -1,6 +1,7 @@
 // 設定メニュー: X68000 の画面の上に重ねて出す。ベアメタル版とホスト版で同じものを使う。
 //
 // 開き方: メニューのキー (isMenuKey(): Scroll Lock、Application、Menu。Pi 400 はラズベリー + M、ホスト版は F12 も)。
+// ゲームパッドの Home か Select + 上でも開き、メニューの中のボタンはこれらのキーに置き換えて渡す (platform/input_map.h の PadMenuInput)。
 // どれも X68000 のキーに対応していない usage なので、X68000 のキーを潰さない。
 // 開いている間、キーは X68000 に送らない (MenuKeyFilter)。開くときに押しているキーはすべて離したことにし、
 // 閉じるときに押したままのキー (閉じるのに押した Enter など) は、一度離すまで X68000 に送らない。
@@ -23,7 +24,8 @@
 // 変えたときは MenuHost::videoChanged() を呼び、すぐに反映する。
 // 画面の隅の数字 (OSD) も、変えたときに MenuHost::osdChanged() を呼び、すぐに反映する。
 //
-// 文字は platform/menu_font.h の 8x16 (ASCII)。描く先は XRGB8888 の画素の並び (draw())。
+// 文字は UTF-8 で、ASCII を platform/menu_font.h の 8x16、半角カタカナと全角 (日本語のファイル名) を CGROM の字で描く
+// (platform/text_cells.h)。描く先は XRGB8888 の画素の並び (draw())。
 // ベアメタルでも使えるよう、例外、RTTI、STL、stdio は使わない (ヘッダだけ)。
 #pragma once
 
@@ -33,6 +35,7 @@
 
 #include "platform/menu_font.h"
 #include "platform/settings.h"
+#include "platform/text_cells.h"
 
 namespace platform {
 
@@ -206,8 +209,10 @@ public:
     static constexpr size_t NAME = 96;
     ~MenuFileList() { delete[] names_; }
     void clear() { count_ = 0; }
-    // 足す。いっぱいなら (メモリが足りなければ) false
+    // 足す。いっぱいなら (メモリが足りなければ) false。NAME バイトに入らない長い名前は、切ると別のファイルを指すので
+    // 足さずに true を返す (UTF-8 の日本語の名前は 1 字 3 バイトなので、31 字まで)
     bool add(const char* name) {
+        if (strlen(name) >= NAME) return true;
         if (names_ == nullptr) {
             names_ = new char[MAX][NAME];
             if (names_ == nullptr) return false;
@@ -254,9 +259,10 @@ private:
             if (lower(*a) != lower(*b)) return false;
         return *a == *b;
     }
+    // バイトは符号なしで比べる (UTF-8 の日本語の名前を、英数字の名前のあとに並べる)
     static bool less(const char* a, const char* b) {
         for (; *a && *b; a++, b++)
-            if (lower(*a) != lower(*b)) return lower(*a) < lower(*b);
+            if (lower(*a) != lower(*b)) return (uint8_t)lower(*a) < (uint8_t)lower(*b);
         return *a == 0 && *b != 0;
     }
     char (*names_)[NAME] = nullptr;
@@ -371,6 +377,8 @@ public:
 class Menu {
 public:
     static constexpr int COLS = 48; // メニューの枠の幅 (文字)
+    // 1 行の文字列のバイト数の上限 (0 を含む)。ファイル名は UTF-8 なので、1 桁に 3 バイト (半角カタカナ) まで入るようにする
+    static constexpr int LINE_BYTES = COLS * 3 + 1;
     // 開いたときの状態の行 (操作の説明)。拡張ボードのページでは、Esc が主のページに戻るので、HELP_BOARDS に替えて出す
     static constexpr const char* HELP = "Arrows: select/change  Enter: OK  Esc: close";
     static constexpr const char* HELP_BOARDS = "Arrows: select/change  Enter: OK  Esc: back";
@@ -455,10 +463,13 @@ public:
     // pixels (XRGB8888、1 行 pitch 画素) の width x height の真ん中に描く。下の画面は暗くする。
     // 入りきらなければ文字の数を減らす (幅) か、選んでいる行が見えるように一部だけ出す (高さ。最後の 2 行の「*」の説明
     // (か空行) と状態の行は残す)。文字の倍率は、どのページでも主のページの行の数で決める (ページを移っても変わらない)。
-    // 書く画素には opaque を OR する (ベアメタルのフレームバッファはアルファを 0xff にする)
-    void draw(uint32_t* pixels, int pitch, int width, int height, uint32_t opaque = 0) const {
+    // 書く画素には opaque を OR する (ベアメタルのフレームバッファはアルファを 0xff にする)。
+    // 文字列は UTF-8。半角カタカナと全角 (ファイル名の日本語) は cgrom (CGROM の写し、cgromSize バイト) の字で描く
+    // (platform/text_cells.h。cgrom がなければ半角カタカナは「?」、全角は豆腐)
+    void draw(uint32_t* pixels, int pitch, int width, int height, uint32_t opaque = 0, const uint8_t* cgrom = nullptr,
+              size_t cgromSize = 0) const {
         if (!open_ || width < 16 || height < 16) return;
-        char lines[MAX_ROWS][COLS + 1];
+        char lines[MAX_ROWS][LINE_BYTES];
         int hl = -1;
         int rows = buildLines(lines, hl);
         // 大きな画面では文字を 2 倍、3 倍にする
@@ -506,28 +517,18 @@ public:
                 }
             }
             const uint32_t color = li == 0 ? 0xffe080u : (lines[li][0] == '-' ? 0x909090u : 0xffffffu);
-            drawText(pixels, pitch, x1, y1, x0 + 8 * scale, ty, lines[li], cols, scale, color | opaque);
+            drawText(pixels, pitch, x1, y1, x0 + 8 * scale, ty, lines[li], cols, scale, color | opaque, cgrom, cgromSize);
         }
     }
 
-    // 文字を描く (ASCII 以外は ?)。x の右端と y の下端 (xmax、ymax) を超える分は描かない
+    // UTF-8 の文字列 s を maxChars 桁 (全角は 2 桁) まで描く。入りきらなければ最後を「…」にする (layoutLine())。
+    // x の右端と y の下端 (xmax、ymax) を超える分は描かない
     static void drawText(uint32_t* pixels, int pitch, int xmax, int ymax, int x, int y, const char* s, int maxChars,
-                         int scale, uint32_t color) {
-        for (int i = 0; s[i] && i < maxChars; i++) {
-            int c = (uint8_t)s[i];
-            if (c < MENU_FONT_FIRST || c > MENU_FONT_LAST) c = '?';
-            const uint8_t* g = kMenuFont[c - MENU_FONT_FIRST];
-            for (int gy = 0; gy < 16 * scale; gy++) {
-                const int py = y + gy;
-                if (py < 0 || py >= ymax) continue;
-                const uint8_t bits = g[gy / scale];
-                uint32_t* row = pixels + (size_t)py * pitch;
-                for (int gx = 0; gx < 8 * scale; gx++) {
-                    const int px = x + i * 8 * scale + gx;
-                    if (px >= 0 && px < xmax && (bits & (0x80 >> (gx / scale)))) row[px] = color;
-                }
-            }
-        }
+                         int scale, uint32_t color, const uint8_t* cgrom = nullptr, size_t cgromSize = 0) {
+        uint16_t cells[COLS + 2];
+        if (maxChars > COLS) maxChars = COLS;
+        const int n = layoutLine(s, cells, maxChars);
+        drawCells(pixels, pitch, xmax, ymax, x, y, cells, n, scale, color, cgrom, cgromSize);
     }
 
     // テスト用: 選んでいる項目の名前
@@ -783,12 +784,12 @@ private:
         }
     }
 
-    int buildLines(char (*lines)[COLS + 1], int& hl) const {
+    int buildLines(char (*lines)[LINE_BYTES], int& hl) const {
         int n = 0;
         auto line = [&](const char* s) {
-            if (n < MAX_ROWS) copyString(lines[n++], COLS + 1, s);
+            if (n < MAX_ROWS) copyString(lines[n++], LINE_BYTES, s);
         };
-        char buf[COLS + 1];
+        char buf[LINE_BYTES];
         MenuText t(buf, sizeof buf);
         if (page_ != FILES) {
             line(page_ == BOARDS    ? "Expansion boards  (Esc: back)"
@@ -800,7 +801,7 @@ private:
                 const Item it = item(i);
                 t.clear();
                 t.add(changed(it) ? "*" : " ").add(label(it));
-                char pad[COLS + 1];
+                char pad[LINE_BYTES];
                 MenuText v(pad, sizeof pad);
                 value(it, v);
                 if (v.str()[0]) {
@@ -1192,7 +1193,7 @@ private:
     MenuFileKind fileKind_ = MenuFileKind::FLOPPY;
     int fileDrive_ = 0;
     int fileCursor_ = 0;
-    char statusBuf_[COLS + 1];
+    char statusBuf_[LINE_BYTES];
     MenuText status_;
 };
 

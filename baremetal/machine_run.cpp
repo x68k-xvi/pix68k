@@ -646,6 +646,7 @@ void CKernel::ApplySettings() {
     m_RenderCore = m_Settings.renderCore != 0;
     m_SoundCore = m_Settings.soundCore != 0;
     m_HatBase = m_Settings.hat;
+    m_PadLog = m_Settings.padLog != 0;
     m_KeyLayoutAuto = m_Settings.keyboard == 0;
     m_KeyLayoutCfg = m_Settings.keyboard == 2   ? platform::KeyLayout::PI400_US
                      : m_Settings.keyboard == 3 ? platform::KeyLayout::PI400_JP
@@ -1541,6 +1542,59 @@ bool CKernel::StartMachine() {
             m_Logger.Write(FromMachine, LogWarning, "Neptune-X is not connected");
         }
     }
+#if RASPPI >= 4
+    // 明示的な opt-in。接続済みの第2ディスプレイだけを使う。
+    const unsigned tsPort = m_Options.GetAppOptionDecimal("pix68k_ts6bga", 0);
+    if (tsPort != 0) {
+        if ((tsPort == 1 || tsPort == 2) && CBcmFrameBuffer::GetNumDisplays() >= 2) {
+            CBcmPropertyTags tags;
+            TPropertyTagSimple select;
+            select.nValue = 1;
+            // Pi 5 は表示サイズの変更を無視するので、ファームウェアの実サイズを使う。
+            // display 選択に失敗したときは primary のバッファを確保し直さない。
+            const bool selected = tags.GetTag(PROPTAG_SET_DISPLAY_NUM, &select, sizeof select, 4);
+            const unsigned selectedValue = select.nValue;
+            // Pi 5 は成功時も nValue=0 を返す。Circle と同じくタグの成否で判定する。
+            if (selected)
+                m_TsDisplay = new CBcmFrameBuffer(0, 0, 32, 0, 0, 1);
+            TPropertyTagSimple depth;
+            depth.nValue = 0;
+            const bool initialized = m_TsDisplay && m_TsDisplay->Initialize();
+            const bool depthRead = initialized && tags.GetTag(0x00040005, &depth, sizeof depth);
+            bool ready = initialized && depthRead && depth.nValue == 32;
+            m_Logger.Write(FromMachine, LogNotice,
+                "TS-6BGA HDMI 2: select=%u value=%u, init=%u depth-query=%u depth=%u, buffer=%X size=%u pitch=%u (%ux%u)",
+                unsigned(selected), selectedValue, unsigned(initialized), unsigned(depthRead), depth.nValue,
+                m_TsDisplay ? m_TsDisplay->GetBuffer() : 0, m_TsDisplay ? m_TsDisplay->GetSize() : 0,
+                m_TsDisplay ? m_TsDisplay->GetPitch() : 0, m_TsDisplay ? m_TsDisplay->GetWidth() : 0,
+                m_TsDisplay ? m_TsDisplay->GetHeight() : 0);
+            if (ready) {
+                const auto* primary = m_Screen.GetFrameBuffer();
+                const uint64_t lo = m_TsDisplay->GetBuffer(), hi = lo + m_TsDisplay->GetSize();
+                ready = m_TsDisplay->GetPitch() >= m_TsDisplay->GetWidth() * 4 &&
+                        m_TsDisplay->GetSize() >= uint64_t(m_TsDisplay->GetPitch()) * m_TsDisplay->GetHeight() &&
+                        (!primary || hi <= primary->GetBuffer() ||
+                         lo >= uint64_t(primary->GetBuffer()) + primary->GetSize());
+            }
+            if (!ready || !emu->initTs6bga(tsPort == 2 ? 0xef0000 : 0xee0000)) {
+                delete m_TsDisplay; m_TsDisplay = nullptr;
+                m_Logger.Write(FromMachine, LogWarning, "TS-6BGA: cannot initialize HDMI 2 or allocate VRAM");
+            } else {
+                SetPixelOrderBgr(); // Initialize() が選んだ display 1 に設定
+                for (unsigned y = 0; y < m_TsDisplay->GetHeight(); ++y)
+                    platform::frame_scale_detail::fillRow<platform::DeviceStore>((uint32_t*)(uintptr_t)
+                        (m_TsDisplay->GetBuffer() + y * m_TsDisplay->GetPitch()), 0xff000000u,
+                        m_TsDisplay->GetWidth());
+                m_Logger.Write(FromMachine, LogNotice, "TS-6BGA at $%X, HDMI 2 %ux%u, scanout on core 0",
+                               tsPort == 2 ? 0xef0000 : 0xee0000, m_TsDisplay->GetWidth(), m_TsDisplay->GetHeight());
+            }
+            select.nValue = 0;
+            tags.GetTag(PROPTAG_SET_DISPLAY_NUM, &select, sizeof select, 4);
+        } else {
+            m_Logger.Write(FromMachine, LogWarning, "TS-6BGA: use pix68k_ts6bga=1 or 2; two connected displays required");
+        }
+    }
+#endif
     // RS-232C (SCC のチャネル A): rs232c=tcp:PORT なら、ネットワークの口 (net=on) の TCP のタスクとつなぐリングを、
     // コア 1 を動かす前につなぐ (つながる相手が来るまでは DCD と CTS が 0)
     {
@@ -1651,6 +1705,7 @@ TShutdownMode CKernel::RunMachine() {
     // (それぞれの大きさは、読んだときのログに出ている)
     ReportHeap(FromMachine, "after loading");
     for (;;) {
+        ShowTsFrame();
         // 装置をつないだり外したりしたあとは、UpdatePlugAndPlay() が装置を登録するまで 0.1 秒ほど戻らない。
         // メニューを開く途中と開いている間は任せない。コア 0 がメニューを重ねて描き、その下には最後にコア 0 が
         // 受け取ったフレーム (m_pLastFrame) を写すので、止める直前のフレームもコア 0 が受け取るようにする
@@ -1690,6 +1745,9 @@ TShutdownMode CKernel::RunMachine() {
         ServiceMessage();
         ServiceAutoType();
         ServiceMenu();
+        // ゲームパッドの Start + Select。設定メニューを開いている間と、deploy の再起動を待たせている間 (X68000 を止めている) は捨てる
+        if (__atomic_exchange_n(&m_PadResetRequested, false, __ATOMIC_ACQ_REL) && !m_MenuActive && !m_DeployHeld)
+            ResetFromGamePad();
         if (m_RebootRequested) {
             m_Logger.Write(FromMachine, LogNotice, "restarting (settings changed in the menu)");
             return ShutdownReboot;
@@ -1912,6 +1970,55 @@ void CKernel::netEndHeavy() {
     LogShownScreen();
 }
 
+// コア0専用。表示とスクショは同じ、読み手が所有するスナップショットを使う。
+void CKernel::ShowTsFrame() {
+    if (!m_TsDisplay) return;
+    if (const auto* frame = m_pEmulator->takeTs6bga()) {
+        m_TsFrame = frame;
+        m_TsChanged = true;
+    }
+    if (!m_TsFrame || (!m_TsChanged &&
+        (m_TsFrame->selected() || m_TsMainShown == m_FramesShownByCore0))) return;
+    const Emulator::Frame* main = m_pLastFrame;
+    const x68k::Ts6bga::Image pass{main ? main->pixels : nullptr,
+        main ? unsigned(main->width) : 0, main ? unsigned(main->height) : 0, Emulator::PITCH};
+    m_TsChanged = false;
+    m_TsMainShown = m_FramesShownByCore0;
+    m_TsFrame->renderRows(m_TsDisplay->GetWidth(), m_TsDisplay->GetHeight(),
+        [](void* ctx, const uint32_t* row, unsigned y, unsigned n) {
+            auto* k = static_cast<CKernel*>(ctx);
+            auto* fb = k->m_TsDisplay;
+            auto* dst = (uint32_t*)(uintptr_t)(fb->GetBuffer() + y * fb->GetPitch());
+            platform::frame_scale_detail::storeRow<platform::DeviceStore>(dst, row, n);
+            // 実出力だけに重ねる。スクショ用の元画像やゲストVRAMは変更しない。
+            constexpr unsigned scale = 2, w = 6 * 8 * scale + 8, h = 16 * scale + 8;
+            if (n < w + 8 || y < 8 || y >= 8 + h) return;
+            const char* label = k->m_TsFrame->selected() ? "TS6BGA" : "MIRROR";
+            const unsigned gy = y - 8;
+            for (unsigned x = 0; x < w; x++) {
+                bool ink = false;
+                if (x >= 4 && x < w - 4 && gy >= 4 && gy < h - 4) {
+                    const unsigned tx = (x - 4) / scale;
+                    ink = (platform::kMenuFont[label[tx / 8] - platform::MENU_FONT_FIRST][(gy - 4) / scale]
+                           & (0x80 >> (tx % 8))) != 0;
+                }
+                platform::DeviceStore::store4(dst + n - w - 8 + x, ink ? 0x00ffffff : 0x00202020);
+            }
+        }, this, &pass);
+}
+
+bool CKernel::netSnapshotTs6bga(u8* rgb, unsigned capacity, int& width, int& height, bool output) {
+    if (!m_TsDisplay || !m_pEmulator) return false;
+    if (const auto* frame = m_pEmulator->takeTs6bga()) {
+        m_TsFrame = frame;
+        m_TsChanged = true; // スクショが受け取ったフレームも次の表示で写す
+    }
+    if (!m_TsFrame) return false;
+    if (output && !m_TsFrame->selected()) return netSnapshotScreen(rgb, capacity, width, height);
+    // RGBへの変換が終わるまでタスクを譲らない。コア1はこのコピーを上書きしない。
+    return m_TsFrame->snapshotRgb(rgb, capacity, width, height);
+}
+
 // 今の画面を RGB で写す (GET /screen.ppm)。写す役を合成するコアに任せている間 (HTTP のタスクはいつも
 // netBeginHeavy() の中で動く) は、その間に合成したフレームがコア 0 に渡らず、m_pLastFrame は任せる前のまま古い。
 // 主ループもほとんどの時間を任せたまま過ごすので (USB の装置の確認とネットワークのタスク)、コア 0 が受け取るのは
@@ -2056,6 +2163,7 @@ void CKernel::ShowTakenFrame(const Emulator::Frame* frame) {
     m_FramesShownByCore0++;
     UpdateOsd();
     m_pLastFrame = frame; // 次に takeFrame() を呼ぶまで、コア 1 / 2 はこのバッファに描かない
+    ShowTsFrame(); // 通常画面はフィルター前の新しいフレームから第2 HDMIへ写す
     if (__atomic_load_n(&m_BootTicks[BootFrame], __ATOMIC_RELAXED) == 0)
         __atomic_store_n(&m_BootTicks[BootFrame], CTimer::GetClockTicks64(), __ATOMIC_RELAXED);
     LogShownScreen();
@@ -3174,6 +3282,7 @@ void CKernel::LoadMidiMt32() {
     delete[] data[0];
     delete[] data[1];
     if (synth != nullptr) {
+        m_pMt32 = synth;
         m_pMidiOut = synth;
         m_pEmulator->setMidiOut(synth);
     }
@@ -3462,12 +3571,33 @@ void CKernel::ReportSpeed() {
         m_Logger.Write(FromMachine, LogNotice, "sound: %u underrun(s), %u ms buffered, aiming for at least %u ms",
                        m_pEmulator->audioUnderruns(), m_pEmulator->audioFill() * 1000 / pix68k_sound::RATE,
                        m_pEmulator->audioGoal() * 1000 / pix68k_sound::RATE);
+    ReportSoundLevels();
     ReportDisks();
     if (m_pEmulator->soundCoreActive()) {
         uint32_t wakes, empty;
         m_pEmulator->soundCoreWakes(wakes, empty);
         m_Logger.Write(FromMachine, LogNotice, "core 3: woke %u times, %u of them with nothing to do (in total)", wakes,
                        empty);
+    }
+}
+
+// 前に出してからの音の大きさ (x68k::Sound::takeLevels()): MIDI の音源を足す前の音の最大、MIDI の音源が足した量の最大
+// (どちらも 16 ビットの上限 32767 に対する値)、足して 16 ビットを超え、止めたフレームの数。MIDI の音源が鳴ったか、
+// 止めたフレームがあった区間だけ出す。音が割れるときに、振り切れているのか (止めたフレームが多い)、MIDI の音源の
+// 出力そのものが上限に張りついているのか (最大が 32767)、どちらでもないのかを見分けるためのもの。
+// MT-32 の音源が捨てたメッセージ (待ち行列が満杯) とシステムエクスクルーシブ (長すぎ) の数は、増えたときに出す
+void CKernel::ReportSoundLevels() {
+    const x68k::Sound::Levels lv = m_pEmulator->takeAudioLevels();
+    if (lv.midi != 0 || lv.clipped != 0)
+        m_Logger.Write(FromMachine, LogNotice, "sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix",
+                       (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);
+    if (m_pMt32 != nullptr) {
+        const uint32_t messages = m_pMt32->droppedMessages(), sysex = m_pMt32->droppedSysex();
+        if (messages != m_Mt32DroppedLogged[0] || sysex != m_Mt32DroppedLogged[1])
+            m_Logger.Write("midi", LogWarning, "MT-32: dropped %u message(s) (queue full) and %u SysEx (too long) in total",
+                           (unsigned)messages, (unsigned)sysex);
+        m_Mt32DroppedLogged[0] = messages;
+        m_Mt32DroppedLogged[1] = sysex;
     }
 }
 
@@ -3650,6 +3780,33 @@ void CKernel::ResendKeys() {
 void CKernel::SendGamePad(int slot) {
     if (m_PadSent[slot] == (int)m_PadWant[slot]) return;
     if (m_pEmulator->joystickEvent(slot, m_PadWant[slot])) m_PadSent[slot] = m_PadWant[slot];
+}
+
+// ゲームパッドの Start + Select を押したとき (コア 0 の主ループ)。設定メニューの Reset と同じく、X68000 を止めて
+// ディスクを書いてからリセットし (resetMachine())、動かし直す。止まらなければリセットしない
+void CKernel::ResetFromGamePad() {
+    Emulator* emu = m_pEmulator;
+    m_Logger.Write(FromMachine, LogNotice, "gamepad Start+Select: resetting the X68000");
+    emu->requestPause(true);
+    const u64 t0 = CTimer::GetClockTicks64();
+    while (!emu->paused()) {
+        asm volatile("sev");
+        if (CTimer::GetClockTicks64() - t0 > 5 * CLOCKHZ) {
+            m_Logger.Write(FromMachine, LogWarning, "gamepad Start+Select: core 1 did not pause; not reset");
+            emu->requestPause(false);
+            return;
+        }
+    }
+    // midi_out=uart なら、実機の音源で鳴っている音を止める (メニューを開いたときと同じ)
+    SilenceMidiUart(0);
+    resetMachine();
+    // 止めていた間は数えない。画面の隅の数字は数え直し、数え終えるまで出さない (CloseMenu() と同じ)
+    PublishOsd(platform::OsdValue());
+    m_OsdTicks = 0;
+    // コア 1 が動き出すまで待つ (CloseMenu() と同じ)
+    emu->requestPause(false);
+    const u64 t1 = CTimer::GetClockTicks64();
+    while (emu->paused() && CTimer::GetClockTicks64() - t1 < CLOCKHZ) asm volatile("sev");
 }
 
 bool CKernel::InputPending() const {

@@ -26,6 +26,25 @@ int AudioRing::drain(int16_t* out, int maxFrames) {
     return n;
 }
 
+int AudioRing::copyPending(int16_t* out, int maxFrames) const {
+    unsigned t = __atomic_load_n(&tail_, __ATOMIC_RELAXED);
+    unsigned h = __atomic_load_n(&head_, __ATOMIC_ACQUIRE);
+    int n = 0;
+    for (; t != h && n < maxFrames; t++, n++) {
+        uint32_t v = buf_[t & (SIZE - 1)];
+        out[2 * n] = (int16_t)(uint16_t)v;
+        out[2 * n + 1] = (int16_t)(uint16_t)(v >> 16);
+    }
+    return n;
+}
+
+void AudioRing::clearStopped() {
+    __atomic_store_n(&head_, 0u, __ATOMIC_RELAXED);
+    __atomic_store_n(&tail_, 0u, __ATOMIC_RELAXED);
+    primed_ = starved_ = false;
+    lastL_ = lastR_ = 0;
+}
+
 void AudioRing::readAudio(int16_t* out, int frames) {
     int n = 0;
     if (!primed_ && fill() >= prebuffer()) {
@@ -331,7 +350,9 @@ void Sound::output(int32_t l, int32_t r, MidiOut* midi, CdMixer* cd) {
             ol += cl >> 1;
             orr += cr >> 1;
         }
+        const int32_t bl = ol, br = orr;
         if (midi) midi->mixFrame(ol, orr);
+        noteLevels(bl, br, ol, orr);
         if (cd || midi) {
             ol = ol > 32767 ? 32767 : ol < -32768 ? -32768 : ol;
             orr = orr > 32767 ? 32767 : orr < -32768 ? -32768 : orr;

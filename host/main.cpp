@@ -136,6 +136,7 @@ static inline char* realpath(const char* p, char* out) { return _fullpath(out, p
 #include "host_serial.h"
 
 #include "platform/crt_effect.h"
+#include "platform/input_map.h"
 #include "platform/boot_profile.h"
 #include "platform/cue_sheet.h"
 #include "platform/menu.h"
@@ -444,6 +445,7 @@ public:
             default: break;
             }
         }
+        repeatPadMenuKey();
         return quit;
     }
 
@@ -492,6 +494,8 @@ public:
 
     // メニューを閉じたあとに呼ぶ (ゲームコントローラの今の状態を X68000 に送り直す)
     void refresh() { updateJoysticks(); }
+    // ゲームコントローラの Start + Select (Back) を押したときに呼ぶもの (X68000 のリセット)
+    void setPadReset(std::function<void()> onReset) { onPadReset_ = onReset; }
 
 private:
     bool menuOpen() const { return menu_ && menu_->isOpen(); }
@@ -504,6 +508,7 @@ private:
                 if (!(joyKeys_ && joyKeyBit((uint8_t)u))) sink_.onKey((uint8_t)u, false);
             }
         keyJoy_ = 0;
+        padLastKey_ = 0;
         setCapture(false);
         if (onOpen_) onOpen_();
         updateJoysticks();
@@ -556,6 +561,7 @@ private:
         for (int i = 0; i < 2; i++) {
             if (pads_[i]) continue;
             pads_[i] = SDL_GameControllerOpen(index);
+            padInput_.reset(i);
             if (pads_[i]) printf("joystick %d: %s\n", i + 1, SDL_GameControllerName(pads_[i]));
             updateJoysticks();
             return;
@@ -567,9 +573,20 @@ private:
             if (!pads_[i] || SDL_JoystickInstanceID(SDL_GameControllerGetJoystick(pads_[i])) != id) continue;
             SDL_GameControllerClose(pads_[i]);
             pads_[i] = nullptr;
+            padInput_.reset(i);
             printf("joystick %d removed\n", i + 1);
         }
         updateJoysticks();
+    }
+
+    // Guide、Back、Start を TGamePadButton の Home、Select、Start のビットにする (platform::PadPairInput)
+    static unsigned padButtons(SDL_GameController* p) {
+        if (!p) return 0;
+        unsigned v = 0;
+        if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_GUIDE)) v |= platform::PadMenuInput::HOME_BITS;
+        if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_BACK)) v |= platform::PadMenuInput::SELECT_BITS;
+        if (SDL_GameControllerGetButton(p, SDL_CONTROLLER_BUTTON_START)) v |= platform::PadResetCombo::START_BITS;
+        return v;
     }
 
     static uint8_t padBits(SDL_GameController* p) {
@@ -588,22 +605,53 @@ private:
         return v;
     }
 
-    // メニューを開いている間は、ジョイスティックを離したことにする
+    // メニューを開いている間は、ジョイスティックを離したことにする。
+    // Start + Select (Back) を押したら X68000 をリセットする (ベアメタル版と同じ判定。メニューを開いている間は扱わない)
+    // Guide (Home) か、Back (Select) を押しながら上で、設定メニューを開く / 閉じる。メニューの中では、十字キーと左スティックを
+    // ↑↓←→、A / X を Enter、B / Y を Esc にする。Start + Back で X68000 をリセットする (メニューを開いている間は扱わない)。
+    // 判定はベアメタル版と同じ platform::PadResetCombo と PadMenuInput (2 台をまとめて platform::PadPairInput)
     void updateJoysticks() {
+        const bool wasOpen = menuOpen();
+        platform::PadPairInput::Pad in[2];
         for (int i = 0; i < 2; i++) {
-            uint8_t v = menuOpen() ? 0 : padBits(pads_[i]);
-            if (i == 0 && !menuOpen()) v |= keyJoy_;
+            in[i].present = pads_[i] != nullptr;
+            in[i].buttons = padButtons(pads_[i]);
+            in[i].bits = padBits(pads_[i]);
+        }
+        const platform::PadPairInput::Result r = padInput_.update(in, wasOpen);
+        // 1 台目でメニューを閉じたら、2 台目のキーは渡さない
+        for (int e = 0; e < r.nEvents && menuOpen(); e++) {
+            menu_->key(r.events[e]);
+            padLastKey_ = r.events[e];
+        }
+        for (int i = 0; i < 2; i++) {
+            uint8_t v = r.joy[i];
+            if (i == 0 && !wasOpen) v |= keyJoy_;
             if (v != joy_[i]) {
                 joy_[i] = v;
                 sink_.onJoystick(i, v);
             }
         }
+        if (r.reset && onPadReset_) onPadReset_();
+        if (r.open && menu_ && !menuOpen()) openMenu();
+    }
+    // メニューの中で、ゲームコントローラの上下左右を押し続けたら繰り返す (キーボードは OS のキーリピートを渡している)
+    void repeatPadMenuKey() {
+        uint8_t held = 0;
+        if (menuOpen() && platform::MenuKeyRepeat::repeats(padLastKey_) &&
+            padInput_.holds(padLastKey_))
+            held = padLastKey_;
+        if (const uint8_t r = padRepeat_.update(held, SDL_GetTicks())) menu_->key(r);
     }
 
     Sink& sink_;
     bool joyKeys_;
     platform::Menu* menu_;
     std::function<void()> onOpen_;
+    std::function<void()> onPadReset_;
+    platform::PadPairInput padInput_;
+    platform::MenuKeyRepeat padRepeat_;
+    uint8_t padLastKey_ = 0; // メニューに最後に渡した、ゲームコントローラのキー
     bool canCapture_ = true;
     bool captured_ = false;
     uint8_t buttons_ = 0;
@@ -1224,7 +1272,9 @@ bool readConfigFile(Options& opt) {
 }
 
 // X68000 の画面 (w x h) を kMenuWidth x kMenuHeight に引き伸ばし、メニューを重ねる
-void composeMenu(const uint32_t* screen, int w, int h, uint32_t* out, const platform::Menu& menu) {
+// cgrom は日本語のファイル名の字に使う (なければ nullptr)
+void composeMenu(const uint32_t* screen, int w, int h, uint32_t* out, const platform::Menu& menu, const uint8_t* cgrom,
+                 size_t cgromSize) {
     for (int y = 0; y < kMenuHeight; y++) {
         uint32_t* row = out + (size_t)y * kMenuWidth;
         if (w <= 0 || h <= 0) {
@@ -1234,7 +1284,7 @@ void composeMenu(const uint32_t* screen, int w, int h, uint32_t* out, const plat
         const uint32_t* src = screen + (size_t)(y * h / kMenuHeight) * x68k::Renderer::MAX_WIDTH;
         for (int x = 0; x < kMenuWidth; x++) row[x] = src[x * w / kMenuWidth];
     }
-    menu.draw(out, kMenuWidth, kMenuWidth, kMenuHeight);
+    menu.draw(out, kMenuWidth, kMenuWidth, kMenuHeight, 0, cgrom, cgromSize);
 }
 
 // --press: 決めた回から、キーを 2 回に 1 つずつ押して離す (試験用)
@@ -1991,6 +2041,10 @@ int runMachine(Options& opt) {
         menu.open(runningSettings(opt), opt.fileSettings);
         printf("menu: opened\n");
     });
+    input.setPadReset([&]() {
+        m->powerOn();
+        printf("gamepad Start+Select: reset\n");
+    });
     PressScript press(opt.press, opt.pressAfter);
     int shownLeds = -1;
     bool shownCapture = false;
@@ -2020,7 +2074,8 @@ int runMachine(Options& opt) {
         if (menu.isOpen()) {
             // メニューを開いている間は X68000 を止め、止めたときの画面にメニューを重ねて出す
             menuWasOpen = true;
-            composeMenu(screen, renderer.width(), renderer.height(), overlay, menu);
+            composeMenu(screen, renderer.width(), renderer.height(), overlay, menu, haveCg ? cg : nullptr,
+                        haveCg ? sizeof cg : 0);
             video->setOsd(platform::OsdValue()); // メニューを開いている間は出さない
             video->setMessage(nullptr, messageGen);
             video->present(overlay, kMenuWidth, kMenuHeight, kMenuWidth);
@@ -2111,6 +2166,13 @@ int runMachine(Options& opt) {
     if (opt.wav) {
         printf("wav: %u frames to %s\n", wav.frames(), opt.wav);
         wav.close();
+    }
+    // 音の大きさ (x68k::Sound::takeLevels())。MIDI の音源が鳴ったか、足して 16 ビットを超えて止めたフレームがあるときだけ出す
+    {
+        const x68k::Sound::Levels lv = m->sound().takeLevels();
+        if (lv.midi != 0 || lv.clipped != 0)
+            printf("sound level: peak %u before MIDI, MIDI peak %u (of 32767), %u frame(s) clipped after the mix\n",
+                   (unsigned)lv.base, (unsigned)lv.midi, (unsigned)lv.clipped);
     }
 
     if (opt.dumpText && haveCg) {

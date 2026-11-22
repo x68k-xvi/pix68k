@@ -31,12 +31,10 @@ rsync -a --delete --exclude .git \
   --exclude /include/circle/timer.h --exclude /lib/usb/dwhcidevice.cpp --exclude /lib/net/udpconnection.cpp \
   "$ROOT/external/circle/" "$OUT/circle/"
 cd "$OUT/circle"
-# FatFs の設定: 大きなディスクのイメージ (数百 MB) の中を読み書きするので、FAT をたどらずに位置を変えられる
-# fast seek (FF_USE_FASTSEEK) を有効にする。submodule は変えず、写した先だけを書き換える
-# (中身が変わったときだけ置き換え、毎回 FatFs を作り直さないようにする)
+# FatFs の設定は tools/ffconf_patch.sh で書き換える (fast seek、UTF-8 のファイル名など。理由はそちらに書いた)。
+# submodule は変えず、写した先だけを書き換える (中身が変わったときだけ置き換え、毎回 FatFs を作り直さないようにする)
 FFCONF=addon/fatfs/ffconf.h
-sed 's/^#define FF_USE_FASTSEEK[[:space:]]*0/#define FF_USE_FASTSEEK	1/' "$ROOT/external/circle/$FFCONF" > "$FFCONF.tmp"
-grep -q '^#define FF_USE_FASTSEEK[[:space:]]*1' "$FFCONF.tmp" || { echo "FF_USE_FASTSEEK not found in $FFCONF" >&2; exit 1; }
+sh "$ROOT/tools/ffconf_patch.sh" "$ROOT/external/circle/$FFCONF" "$FFCONF.tmp"
 if cmp -s "$FFCONF.tmp" "$FFCONF"; then rm "$FFCONF.tmp"; else mv "$FFCONF.tmp" "$FFCONF"; fi
 # CTimer::MsDelay(): pix68k_msdelay_hook (baremetal/kernel.cpp) が nullptr でなければ、それを呼ぶ (ほかのコアが読む間に
 # コア 0 が nullptr に戻すことがあるので、1 回だけ読む)。

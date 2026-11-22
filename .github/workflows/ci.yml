@@ -28,12 +28,19 @@ jobs:
         run: tools/fetch_sst.sh
       - name: Musashi を取得 (差分テスト用)
         run: tools/fetch_musashi.sh
+      - name: submodule を取得 (fatfs_names_test が Circle の FatFs を使う)
+        run: git submodule update --init --depth 1
       - name: ビルド
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DPIX68K_LIBRETRO=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
           cmake --build build
       - name: テスト
         run: cd build && ctest --output-on-failure
+      - name: Vita 用の 68000・FPU なしの構成をホストで検証
+        run: |
+          cmake -S libretro/vita -B build/vita-profile -DPIX68K_PORTABLE_TEST_SHARED=ON
+          cmake --build build/vita-profile -j 4
+          ctest --test-dir build/vita-profile --output-on-failure
       - name: pico_kbd のホストの試験
         run: tools/pico_kbd/run_host_tests.sh build/pico_kbd_host
 
@@ -50,12 +57,19 @@ jobs:
         run: tools/fetch_sst.sh
       - name: Musashi を取得 (差分テスト用)
         run: tools/fetch_musashi.sh
+      - name: submodule を取得 (fatfs_names_test が Circle の FatFs を使う)
+        run: git submodule update --init --depth 1
       - name: ビルド
         run: |
-          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DPIX68K_REQUIRE_SDL2=ON -DPIX68K_LIBRETRO=ON -DMUSASHI_DIR="$HOME/.cache/pix68k/musashi"
           cmake --build build -j
       - name: テスト
         run: cd build && ctest --output-on-failure
+      - name: Vita 用の 68000・FPU なしの構成をホストで検証
+        run: |
+          cmake -S libretro/vita -B build/vita-profile -DPIX68K_PORTABLE_TEST_SHARED=ON
+          cmake --build build/vita-profile -j 4
+          ctest --test-dir build/vita-profile --output-on-failure
 
   pix68kcli:
     # HTTP の口を操作するコマンド (tools/pix68kcli、Go)。Go の版は release.yml の GO_VERSION と同じにする

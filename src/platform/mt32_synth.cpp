@@ -186,17 +186,17 @@ uint32_t Mt32Synth::timestamp() const {
 }
 
 void Mt32Synth::sendShort(uint32_t msg) {
-    if (!synth_->playMsg(msg, timestamp())) droppedMessages_++;
+    if (!synth_->playMsg(msg, timestamp())) __atomic_fetch_add(&droppedMessages_, 1u, __ATOMIC_RELAXED);
 }
 
 void Mt32Synth::endSysex() {
     inSysex_ = false;
     if (sysexOver_) {
-        droppedSysex_++;
+        __atomic_fetch_add(&droppedSysex_, 1u, __ATOMIC_RELAXED);
         return;
     }
     sysex_[sysexLen_++] = 0xf7;
-    if (!synth_->playSysex(sysex_, (MT32Emu::Bit32u)sysexLen_, timestamp())) droppedMessages_++;
+    if (!synth_->playSysex(sysex_, (MT32Emu::Bit32u)sysexLen_, timestamp())) __atomic_fetch_add(&droppedMessages_, 1u, __ATOMIC_RELAXED);
 }
 
 void Mt32Synth::midiByte(uint8_t b) {

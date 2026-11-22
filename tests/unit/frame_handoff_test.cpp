@@ -28,6 +28,66 @@ void spinAt(const unsigned& flag, int line) {
 }
 #define spin(flag) spinAt(flag, __LINE__)
 
+// 第2出力向けに、直接表示したフレームも所有権を保って受け取れる。
+void testRetainSelfFrames() {
+    platform::FrameHandoff h;
+    h.retainSelfFrames();
+    const unsigned first = h.writer();
+    h.publish([](unsigned) {});
+    h.begin();
+    unsigned calls = 0;
+    h.publish([&](unsigned) { calls++; });
+    CHECK_EQ(calls, 2u); // 残っていた通常フレームも先に表示
+    for (unsigned n = 0; n < 100; n++) {
+        const unsigned rendered = h.writer();
+        h.publish([&](unsigned) { calls++; });
+        CHECK_EQ(h.latest(), (int)rendered);
+        CHECK_EQ(h.writer() != rendered, true);
+        h.end([] {});
+        CHECK_EQ(h.take(), (int)rendered);
+        CHECK_EQ(h.writer() != rendered, true);
+        CHECK_EQ(h.take(), -1);
+        h.begin();
+    }
+    CHECK_EQ(calls, 102u); // 保持した表示済みフレームを重複表示しない
+    h.publish([&](unsigned) { calls++; });
+    h.publish([&](unsigned) { calls++; }); // 読み手が遅れても表示済みは drop に数えない
+    h.end([] {});
+    h.publish([](unsigned) { CHECK_EQ(0, 1); });
+    CHECK_EQ(h.dropped(), 0u);
+    CHECK_EQ(first != h.writer(), true);
+}
+
+// 並行して更新しても、受け取った画像は次の take() まで不変。
+void testRetainThreads() {
+    platform::FrameHandoff h;
+    h.retainSelfFrames();
+    unsigned pixels[3] = {}, done = 0;
+    std::thread producer([&] {
+        for (unsigned n = 1; n <= 100000; n++) {
+            pixels[h.writer()] = n;
+            h.publish([](unsigned) {});
+        }
+        __atomic_store_n(&done, 1u, __ATOMIC_RELEASE);
+    });
+    unsigned last = 0;
+    while (!__atomic_load_n(&done, __ATOMIC_ACQUIRE)) {
+        h.end([] { std::this_thread::yield(); });
+        const int i = h.take();
+        h.begin();
+        if (i >= 0) {
+            const unsigned value = pixels[i];
+            CHECK_EQ(value > last, true);
+            last = value;
+            for (unsigned n = 0; n < 20; n++) std::this_thread::yield();
+            CHECK_EQ(pixels[i], value);
+        }
+    }
+    producer.join();
+    h.end([] {});
+    CHECK_EQ(pixels[h.latest()], 100000u);
+}
+
 void testNormal() {
     printf("normal handoff\n");
     platform::FrameHandoff h;
@@ -476,6 +536,8 @@ void testThreads() {
 int main() {
     // 出力をパイプに流していても (ctest)、途中で止まったときにそこまでの行が残るよう、1 行ごとに書き出す
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    testRetainSelfFrames();
+    testRetainThreads();
     testNormal();
     testPendingFrame();
     testEndBeforePublish();

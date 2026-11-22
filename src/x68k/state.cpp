@@ -17,8 +17,10 @@
 
 #include <string.h>
 
+#ifndef PIX68K_NO_CPU020
 #include "m68k/cpu020.h"
 #include "m68k/fpu.h"
+#endif
 #include "x68k/machine.h"
 
 namespace x68k {
@@ -110,6 +112,7 @@ void StateIO::bytes(void* p, size_t n) {
 }
 
 // se (2 バイト)、詰め物 (6 バイト)、m (8 バイト)。X を丸ごと書いていたときと同じ並び
+#if !defined(PIX68K_NO_CPU020) || !defined(PIX68K_NO_FPU_BOARD)
 void StateIO::io(m68k::fp::X& v) {
     static_assert(sizeof v == 16 && offsetof(m68k::fp::X, m) == 8 && sizeof v.se == 2, "layout of fp::X in the state");
     uint8_t pad[6] = {};
@@ -117,6 +120,8 @@ void StateIO::io(m68k::fp::X& v) {
     bytes(pad, sizeof pad);
     bytes(&v.m, sizeof v.m);
 }
+
+#endif
 
 void StateIO::local(void* p, size_t n) {
     if (!ok_ || mode_ == SHIFT) return;
@@ -136,6 +141,10 @@ void StateIO::tag(uint32_t t) {
 }
 
 void StateIO::memory(uint8_t* p, size_t n) {
+    if (mode_ == SIZE && fullMemory_) {
+        pos_ += n + (n + kPage - 1) / kPage;
+        return;
+    }
     for (size_t a = 0; a < n && ok_; a += kPage) {
         const size_t len = n - a < kPage ? n - a : kPage;
         uint8_t used = 0;
@@ -615,6 +624,7 @@ void Neptune::state(StateIO& s) {
 }
 
 // 数値演算プロセッサボード。FpuCore は計算の時間を足す先 (ポインタ) を持つので、レジスタだけを入れる
+#ifndef PIX68K_NO_FPU_BOARD
 void FpuBoard::state(StateIO& s) {
     s.tag(0x36383831); // "6881"
     s.io(core_.fp_);
@@ -648,6 +658,8 @@ void FpuBoard::state(StateIO& s) {
     // 受け渡し終えているのに受け渡しの途中、という状態にはしない (buf_[pos_] を読み書きしてから数を比べる)
     if (s.applying() && phase_ != P_IDLE && phase_ != P_REGSEL && pos_ >= len_) phase_ = P_IDLE;
 }
+
+#endif
 
 // ---------------------------------------------------------------- 仮想関数やポインタを持つもの
 
@@ -1118,7 +1130,7 @@ void Video::state(StateIO& s) {
     s.memory(sprite_, sizeof sprite_);
     colorTablesState(s);
     // CRTC の世代は保存しない。読んだときは、世代で覚えている計算 (Machine と Renderer) をやり直させるために進める
-    if (s.applying()) crtcWrites_ += 1;
+    if (s.applying()) { crtcWrites_ += 1; spriteRowsWrites_ += 1; }
 }
 
 // 色の表は palette_ から作れるが、前の版のステートと並びを合わせるために 4 つとも書く。
@@ -1131,8 +1143,10 @@ void Video::colorTablesState(StateIO& s) {
 
 void Video::copyStateFrom(const Video& from) {
     VideoJournal* j = journal_;
+    const uint32_t nextRows = spriteRowsWrites_ + 1;
     *this = from;
     journal_ = j;
+    spriteRowsWrites_ = nextRows;
 }
 
 void copyVideoState(const Video& from, Video& to) { to.copyStateFrom(from); }
@@ -1172,6 +1186,7 @@ void Machine::state(StateIO& s) {
     spc_.state(s);
     spcEx_.state(s); // 外付け SCSI ボード (ボードの有無はヘッダで確かめている。なければ使わないまま)
     // 数値演算プロセッサボードとまーきゅりーゆにっと (つないでいるときだけ。有無はヘッダで確かめている)
+#ifndef PIX68K_NO_FPU_BOARD
     if (fpuBoards_[0]) {
         s.tag(0x46505542); // "FPUB"
         fpuBoards_[0]->state(s);
@@ -1181,9 +1196,14 @@ void Machine::state(StateIO& s) {
         s.tag(0x46505532); // "FPU2"
         fpuBoards_[1]->state(s);
     }
+#endif
     if (mercury_) {
         s.tag(0x4d455243); // "MERC"
         mercury_->state(s);
+    }
+    if (ts6bga_) {
+        s.tag(0x54533642); // TS6B (version 17)
+        ts6bga_->state(s);
     }
     if (neptune_) {
         s.tag(0x4e455054); // "NEPT"
@@ -1293,15 +1313,25 @@ size_t stateSize(Machine& m) {
     return STATE_HEADER_SIZE + s.pos();
 }
 
+size_t stateSizeBound(Machine& m) {
+    StateIO s(StateIO::SIZE, nullptr, 0);
+    s.countFullMemory();
+    m.state(s);
+    return STATE_HEADER_SIZE + s.pos();
+}
+
 // つないでいる拡張ボード (ヘッダの +60)
 static uint32_t boardBits(Machine& m) {
     return (m.fpuBoard() ? 1u : 0u) | (m.mercury() ? 2u : 0u) | (m.neptune() ? 4u : 0u) | (m.midiBoard() ? 8u : 0u) |
-           (m.fpuBoard(1) ? 16u : 0u);
+           (m.fpuBoard(1) ? 16u : 0u) | (m.ts6bga() ? 32u : 0u) |
+           (m.ts6bga() && m.ts6bga()->window(0xef0000) ? 64u : 0u);
 }
 
 bool saveState(Machine& m, uint8_t* out, size_t cap, size_t& written, uint32_t version) {
     written = 0;
     if (!m.ok() || cap < STATE_HEADER_SIZE || version < 2 || version > STATE_VERSION) return false;
+    if (version < 17 && m.ts6bga()) return false;
+    if (version < 18 && m.ts6bga() && m.ts6bga()->bltBusy()) return false;
     if (version < STATE_FPU_BOARD2 && m.fpuBoard(1)) return false; // 版 15 までの並びには 2 枚目のボードがない
     StateIO s(StateIO::SAVE, out + STATE_HEADER_SIZE, cap - STATE_HEADER_SIZE, version);
     m.state(s);
@@ -1356,7 +1386,7 @@ bool loadState(Machine& m, const uint8_t* data, size_t size, const char*& error)
     // 版 15 までのファイルに 2 枚目のボード (bit4) はない (あれば作ったファイル。2 枚目をつないだ Machine とは
     // ボードの組み合わせが合わないので、どちらにしても読まない)
     const uint32_t boards = get32(data + 60);
-    if (boards != boardBits(m) || (version < STATE_FPU_BOARD2 && (boards & 16u))) {
+    if ((version < 17 && (boards & 96u)) || boards != boardBits(m) || (version < STATE_FPU_BOARD2 && (boards & 16u))) {
         error = "expansion boards differ";
         return false;
     }

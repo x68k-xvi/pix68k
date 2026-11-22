@@ -5,6 +5,7 @@
 
 #include <stdint.h>
 
+#include "platform/menu.h"
 #include "platform/platform.h"
 
 namespace platform {
@@ -243,6 +244,211 @@ inline uint8_t joystickBits(const GamePadInput& in) {
     }
     return v;
 }
+
+// Circle が配置を知らないゲームパッド (CUSBGamePadStandardDevice が HID のレポートのボタンを順に並べて渡す) のうち、
+// VID:PID でボタンの並びが分かるもの。レポートの i 番目のボタンを、Circle が配置を知っているゲームパッドと同じ
+// TGamePadButton のビット (map[i]) に並べ直し、known と同じに扱う (十字キーはハットのまま)
+struct PadLayout {
+    uint16_t vid, pid;
+    const char* name;
+    int count;            // map の数 (レポートのボタンの数)
+    uint32_t map[16];     // 0 なら使わない
+};
+
+namespace pad_bit { // TGamePadButton (Circle の usbgamepad.h) のビット
+static constexpr uint32_t HOME = 1u << 0, LT = 1u << 3, RT = 1u << 4, LB = 1u << 5, RB = 1u << 6, Y = 1u << 7,
+                          B = 1u << 8, A = 1u << 9, X = 1u << 10, SELECT = 1u << 11, L3 = 1u << 12, R3 = 1u << 13,
+                          PLUS = 1u << 19, MINUS = 1u << 20;
+} // namespace pad_bit
+
+// Switch 互換の HID のゲームパッドに多い並び: Y、B、A、X、L、R、ZL、ZR、-、+、左スティック、右スティック、Home、Capture。
+// Capture は Circle の Switch Pro コントローラと同じく Select のビットにする
+inline const PadLayout* findPadLayout(uint16_t vid, uint16_t pid) {
+    using namespace pad_bit;
+    static const PadLayout kLayouts[] = {
+        {0x0f0d, 0x00c1, "HORIPAD S", 14,
+         {Y, B, A, X, LB, RB, LT, RT, MINUS, PLUS, L3, R3, HOME, SELECT}},
+    };
+    for (const PadLayout& l : kLayouts)
+        if (l.vid == vid && l.pid == pid) return &l;
+    return nullptr;
+}
+
+// レポートのボタンのビット (raw) を、layout で TGamePadButton のビットに並べ直す
+inline unsigned remapPadButtons(const PadLayout& layout, unsigned raw) {
+    unsigned v = 0;
+    for (int i = 0; i < layout.count && i < 32; i++)
+        if (raw & (1u << i)) v |= layout.map[i];
+    return v;
+}
+
+// ゲームパッドの Start + Select (X68000 のリセット) を見つける。ゲームパッドごとに 1 つ持つ。
+// 見るのは Circle が配置を知っているゲームパッド (known) だけ。Start は TGamePadButton の Start (bit14) か Plus (bit19)、
+// Select は Select (bit11) か Minus (bit20)。Switch Pro コントローラは +、- を Plus、Minus で返す
+// (Circle は Switch Pro の Capture も Select と同じ bit11 で返すので、+ と Capture でもリセットになる)。
+// 配置が分からないゲームパッドでは何もしない (どのボタンが Start か分からないため)。
+// 両方を押したときに 1 回だけ true を返し、そのあとは両方を離すまで次を受けない (押しっぱなしで何度もリセットしない)。
+// 最初も、両方を離した状態を一度見るまでは受けない (両方を押したままつないだときに、最初のレポートでリセットしない)
+class PadResetCombo {
+public:
+    static constexpr unsigned START_BITS = (1u << 14) | (1u << 19);
+    static constexpr unsigned SELECT_BITS = (1u << 11) | (1u << 20);
+
+    // ゲームパッドの状態を受け取る。Start + Select を新しく押したら true
+    bool update(bool known, unsigned buttons) {
+        const bool start = known && (buttons & START_BITS) != 0;
+        const bool select = known && (buttons & SELECT_BITS) != 0;
+        if (!start && !select) armed_ = true;
+        if (!start || !select || !armed_) return false;
+        armed_ = false;
+        return true;
+    }
+    // つないだとき、外したときに呼ぶ (両方を離すまで受けない)
+    void reset() { armed_ = false; }
+
+private:
+    bool armed_ = false; // 両方を離したあと、まだリセットしていない
+};
+
+// ゲームパッドで設定メニューを開き、操作する。ゲームパッドごとに 1 つ持つ。
+// 開く / 閉じる: Home (TGamePadButton の Home、bit0。PS ボタン、Xbox のガイドボタン、Switch Pro の Home) を押すか、
+// Select (bit11 か Minus の bit20。Circle は Switch Pro の Capture も bit11 で返す) を押しながら上を押す (Home のないパッド向け)。
+// どちらも Circle が配置を知っているゲームパッド (known) だけ。Start + Select はリセット (PadResetCombo) なので使わない。
+// Start を押している間は Select + 上で開かない (上と Start を押したまま Select を足したときは、リセットだけにする)。
+// Start を先に離しても、Select と上を離して押し直すまでは開かない
+// メニューの中は、キーボードのメニューのキーに置き換える: 上下左右 (十字キー、ハット、アナログ軸。joystickBits() の方向) は
+// ↑↓←→、トリガ A (A、X) は Enter、トリガ B (B、Y) は Esc。閉じるのは Scroll Lock (isMenuKey()) として渡す。
+// 配置の分からないゲームパッドでは開けないが、開いているメニューの中ではボタン 1 / 2 とハット、軸で操作できる。
+// メニューを閉じたときに押していたボタンと方向は、一度離すまで X68000 に送らない (closed())
+class PadMenuInput {
+public:
+    enum Result {
+        PASS, // X68000 に送る (outBits)
+        OPEN, // メニューを開く
+        MENU, // メニューが開いている。events をメニューに渡す
+    };
+    static constexpr unsigned HOME_BITS = 1u << 0;
+    static constexpr unsigned SELECT_BITS = (1u << 11) | (1u << 20);
+    static constexpr int MAX_EVENTS = 6;
+
+    // ゲームパッドの状態 (known、buttons) と、そこから作ったジョイスティックのビット (joystickBits()) を受け取る。
+    // menuOpen: いまメニューを開いているか (開くと決めて、まだ開いていないときも true)
+    Result update(bool known, unsigned buttons, uint8_t bits, bool menuOpen, uint8_t& outBits, uint8_t events[MAX_EVENTS],
+                  int& nEvents) {
+        typedef InputSink S;
+        nEvents = 0;
+        outBits = 0;
+        const bool home = known && (buttons & HOME_BITS) != 0;
+        const bool combo = known && (buttons & SELECT_BITS) != 0 && (bits & S::JOY_UP) != 0;
+        const bool start = known && (buttons & PadResetCombo::START_BITS) != 0;
+        const bool toggle = (home && !home_) || (combo && !combo_ && !start);
+        const uint8_t pressed = (uint8_t)(bits & ~bits_);
+        home_ = home;
+        combo_ = combo;
+        bits_ = bits;
+        mask_ &= bits;     // 離した方向とボタンは隠すのをやめる
+        menuHeld_ &= bits; // 離した方向は繰り返さない
+        if (!menuOpen) menuHeld_ = 0;
+        if (menuOpen) {
+            if (toggle) {
+                events[nEvents++] = menu_key::SCROLL_LOCK;
+                return MENU;
+            }
+            menuHeld_ |= pressed;
+            if (pressed & S::JOY_UP) events[nEvents++] = menu_key::UP;
+            if (pressed & S::JOY_DOWN) events[nEvents++] = menu_key::DOWN;
+            if (pressed & S::JOY_LEFT) events[nEvents++] = menu_key::LEFT;
+            if (pressed & S::JOY_RIGHT) events[nEvents++] = menu_key::RIGHT;
+            if (pressed & S::JOY_A) events[nEvents++] = menu_key::ENTER;
+            if (pressed & S::JOY_B) events[nEvents++] = menu_key::ESC;
+            return MENU;
+        }
+        if (toggle) return OPEN;
+        outBits = (uint8_t)(bits & ~mask_);
+        return PASS;
+    }
+    // メニューを閉じた。いま押している方向とボタンは、一度離すまで送らない (次の update() の outBits から除く)。
+    // 押し続けの繰り返しもやめる (次のレポートが来る前にメニューを開き直したときに、前の押したままを繰り返さないように)
+    void closed() {
+        mask_ = bits_;
+        menuHeld_ = 0;
+    }
+    // メニューの中で押した方向を忘れる (X68000 を動かす前。メニューを開いていることにして update() を呼ぶので)
+    void forgetHeld() { menuHeld_ = 0; }
+    // メニューのキー u に当たる方向を、メニューの中で押してから押し続けているか (↑↓←→ の繰り返し。MenuKeyRepeat)。
+    // メニューを開く前から押していた方向 (もう 1 台のパッドで押したままの方向など) は数えない
+    bool holds(uint8_t u) const {
+        typedef InputSink S;
+        switch (u) {
+        case menu_key::UP: return (menuHeld_ & S::JOY_UP) != 0;
+        case menu_key::DOWN: return (menuHeld_ & S::JOY_DOWN) != 0;
+        case menu_key::LEFT: return (menuHeld_ & S::JOY_LEFT) != 0;
+        case menu_key::RIGHT: return (menuHeld_ & S::JOY_RIGHT) != 0;
+        default: return false;
+        }
+    }
+    // つないだとき、外したときに呼ぶ。変わったときだけレポートを送るゲームパッドでは最初のレポートが押したときなので、
+    // 最初のレポートで Home を押していれば開く (押したままつないだときも開くが、メニューが出るだけ)
+    void reset() {
+        home_ = combo_ = false;
+        bits_ = mask_ = menuHeld_ = 0;
+    }
+
+private:
+    bool home_ = false, combo_ = false; // 前のレポートで Home、Select + 上を押していた
+    uint8_t bits_ = 0;                // 前のレポートのジョイスティックのビット
+    uint8_t mask_ = 0;                // メニューを閉じたときに押していて、まだ離していないビット
+    uint8_t menuHeld_ = 0;            // メニューの中で新しく押して、まだ離していない方向とボタン
+};
+
+// 2 台のゲームパッドの、1 回の入力の更新でのリセット (PadResetCombo) と設定メニュー (PadMenuInput) の判定 (ホスト版。
+// SDL のイベントを受けるたびに、2 台の今の状態をまとめて渡す)。リセットするかは、更新を始めたときにメニューを開いていたか
+// (menuOpen) で決める。同じ更新の中で 1 台目がメニューを閉じても、2 台目の Start + Select ではリセットしない。
+// リセットと開くが同じ更新で重なれば、リセットだけにする。メニューが閉じたら (キーボードで閉じたときも)、押していたボタンと
+// 方向は一度離すまで送らない (PadMenuInput::closed())
+class PadPairInput {
+public:
+    struct Pad {
+        bool present = false; // つないでいる (配置は分かっているものとする)
+        unsigned buttons = 0; // TGamePadButton のビット (Home、Select、Start だけ見る)
+        uint8_t bits = 0;     // ジョイスティックのビット
+    };
+    struct Result {
+        bool reset = false, open = false;
+        uint8_t joy[2] = {0, 0}; // X68000 に送るジョイスティックのビット
+        uint8_t events[2 * PadMenuInput::MAX_EVENTS]; // メニューに渡すキー (1 台目、2 台目の順)
+        int nEvents = 0;
+    };
+    Result update(const Pad pads[2], bool menuOpen) {
+        Result r;
+        if (menuWasOpen_ && !menuOpen)
+            for (int i = 0; i < 2; i++) menu_[i].closed();
+        menuWasOpen_ = menuOpen;
+        for (int i = 0; i < 2; i++) {
+            if (reset_[i].update(pads[i].present, pads[i].buttons) && !menuOpen) r.reset = true;
+            uint8_t out = 0;
+            int n = 0;
+            switch (menu_[i].update(pads[i].present, pads[i].buttons, pads[i].bits, menuOpen, out, r.events + r.nEvents, n)) {
+            case PadMenuInput::OPEN: r.open = true; break;
+            case PadMenuInput::MENU: r.nEvents += n; break;
+            case PadMenuInput::PASS: r.joy[i] = out; break;
+            }
+        }
+        if (r.reset) r.open = false;
+        return r;
+    }
+    // ゲームパッド i をつないだ / 外した
+    void reset(int i) {
+        reset_[i].reset();
+        menu_[i].reset();
+    }
+    bool holds(uint8_t u) const { return menu_[0].holds(u) || menu_[1].holds(u); }
+
+private:
+    PadResetCombo reset_[2];
+    PadMenuInput menu_[2];
+    bool menuWasOpen_ = false;
+};
 
 // USB キーボードの LED を送る。送れなかったら、間を空けて (1 回目は retryTicks、そのあと 2 倍ずつ)
 // MAX_TRIES 回まで送り直す。LED の値が変わったら、すぐに送る。now と retryTicks の単位は呼ぶ側が決める

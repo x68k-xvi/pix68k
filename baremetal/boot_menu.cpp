@@ -68,13 +68,16 @@ void CKernel::ListProfiles(platform::ProfileList& list) {
             }
             // 題は 1 行目だけなので、頭の 512 バイトを読む
             char head[512], title[platform::PROFILE_TITLE_MAX + 1] = "";
+            bool sjis = false;
             FIL f;
             if (f_open(&f, path, FA_READ) == FR_OK) {
                 UINT n = 0;
-                if (f_read(&f, head, sizeof head, &n) == FR_OK) platform::profileTitle(head, n, title, sizeof title);
+                // ファイルが読んだ分より長ければ、1 行目が頭の終わりで切れていることがある
+                if (f_read(&f, head, sizeof head, &n) == FR_OK)
+                    platform::profileTitle(head, n, title, sizeof title, &sjis, f_size(&f) > n);
                 f_close(&f);
             }
-            if (!list.add(name, title)) {
+            if (!list.add(name, title, sjis)) {
                 m_Logger.Write(FromProfile, LogWarning, "out of memory; profiles not listed");
                 full = true;
             }

@@ -14,6 +14,17 @@
 
 namespace x68k {
 
+// Optional backend for ordinary indexed-color layers. Returning true means
+// the backend owns final color conversion for this line; other lines keep
+// using the software renderer. Calls follow the original raster order.
+class IndexedLineSink {
+public:
+    virtual ~IndexedLineSink() = default;
+    virtual void beginLine(int y, int width) = 0;
+    virtual bool above(int y, int width, const uint8_t* front, const uint8_t* graphic,
+                       const uint32_t* textPalette, const uint32_t* graphicPalette) = 0;
+};
+
 class Renderer : public LineListener {
 public:
     static constexpr int MAX_WIDTH = 1024;
@@ -25,6 +36,7 @@ public:
     // columns x rows 画素まで (columns が stride より大きくても、1 行に書くのは stride 画素まで)。
     // dest が nullptr なら描かない
     void setTarget(uint32_t* dest, int stride, int columns, int rows);
+    void setIndexedLineSink(IndexedLineSink* sink) { indexedSink_ = sink; }
 
     // 今の CRTC の設定での画面の大きさ (MAX_WIDTH x MAX_HEIGHT まで)
     void geometry(int& width, int& height) const;
@@ -71,6 +83,13 @@ private:
     uint32_t crtcSeen_ = 0;
     bool geometryValid_ = false;
     bool hasSecondPage_ = false; // 半透明、特殊プライオリティ用: 今のラインのグラフィックにセカンドページがあるか
+    // Sprite Y is 0..1023 with a -16 display offset. Each row holds a
+    // 128-sprite candidate mask, rebuilt only when Y/priority changes.
+    uint32_t spriteRows_[1040][4] = {};
+    uint16_t spriteYSeen_[128] = {};
+    uint8_t spriteEnabledSeen_[128] = {};
+    uint32_t spriteRowsSeen_ = 0;
+    bool spriteRowsValid_ = false;
 
     // 1 ライン分の作業用。どれも [MARGIN, MARGIN + 幅) を使う
     // (最初は 0 で埋めておく)
@@ -95,6 +114,7 @@ private:
     uint64_t textPairs_[256];
     uint32_t textPairsSeen_[16];
     bool textPairsValid_ = false;
+    IndexedLineSink* indexedSink_ = nullptr;
 };
 
 } // namespace x68k

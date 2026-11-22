@@ -9,7 +9,9 @@
 #include <string.h>
 
 #include <algorithm>
+#include <atomic>
 #include <initializer_list>
+#include <thread>
 #include <vector>
 
 #include "platform/midi_stream.h"
@@ -374,6 +376,94 @@ public:
         r -= level;
     }
 };
+
+// 16 ビットを超える量を足す音源 (左は正、右は負)
+class LoudSynth : public x68k::MidiOut {
+public:
+    int32_t level = 0;
+    void midiByte(uint8_t) override {}
+    void mixFrame(int32_t& l, int32_t& r) override {
+        l += level;
+        r -= level;
+    }
+};
+
+// MIDI の音源を足して 16 ビットを超えたら、上限と下限で止める (折り返さない)。大きさの記録 (takeLevels()) は
+// 足した量の最大と、止めたフレームの数を返し、取ると 0 に戻る
+void testMixSaturates() {
+    printf("midi: the mix saturates instead of wrapping, and the levels are recorded\n");
+    static int16_t buf[2 * 4096];
+    x68k::Sound sound;
+    sound.setOutputRate(48000);
+    LoudSynth out;
+    // 範囲の中: そのまま出て、止めたフレームはない
+    out.level = 20000;
+    for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+    int n = sound.ring().drain(buf, 4096);
+    CHECK_EQ(n > 0, true);
+    int bad = 0;
+    for (int i = 0; i < n; i++)
+        if (buf[2 * i] != 20000 || buf[2 * i + 1] != -20000) bad++;
+    CHECK_EQ(bad, 0);
+    x68k::Sound::Levels lv = sound.takeLevels();
+    CHECK_EQ(lv.base, 0u);
+    CHECK_EQ(lv.midi, 20000u);
+    CHECK_EQ(lv.clipped, 0u);
+    // 16 ビットを少し超える量と、int16_t に切り詰めると符号が変わる量 (40000 は -25536、70000 は 4464 になる)
+    for (int32_t level : {32768, 40000, 70000}) {
+        out.level = level;
+        for (int i = 0; i < 100; i++) sound.advance(41, nullptr, &out);
+        n = sound.ring().drain(buf, 4096);
+        CHECK_EQ(n > 0, true);
+        bad = 0;
+        for (int i = 0; i < n; i++)
+            if (buf[2 * i] != 32767 || buf[2 * i + 1] != -32768) bad++;
+        CHECK_EQ(bad, 0);
+        lv = sound.takeLevels();
+        CHECK_EQ(lv.midi, (uint32_t)level);
+        // 左は 32768 から、右は -32769 から止める (-32768 は範囲の中)
+        CHECK_EQ(lv.clipped, (uint32_t)n);
+    }
+    lv = sound.takeLevels();
+    CHECK_EQ(lv.midi, 0u);
+    CHECK_EQ(lv.clipped, 0u);
+}
+
+// 止めたフレームの数は、音を作るのと取るのが別のスレッドで重なっても、消えも重なりもしない: 取った数の合計が、
+// 1 つのスレッドで数えたときと同じになる (-fsanitize=thread でビルドすると、データの競合も調べられる)
+void testLevelsFromAnotherThread() {
+    printf("midi: clipped frames are counted once when another thread takes the levels\n");
+    const int rounds = 200000;
+    const auto run = [&](x68k::Sound& sound) {
+        LoudSynth out;
+        out.level = 40000;
+        sound.setOutputRate(48000);
+        for (int i = 0; i < rounds; i++) sound.advance(41, nullptr, &out);
+    };
+    uint32_t expected;
+    {
+        x68k::Sound sound;
+        run(sound);
+        expected = sound.takeLevels().clipped;
+    }
+    CHECK_EQ(expected > 0, true);
+    x68k::Sound sound;
+    std::atomic<bool> done{false};
+    uint64_t total = 0;
+    unsigned takes = 0;
+    std::thread taker([&] {
+        while (!done.load(std::memory_order_acquire)) {
+            total += sound.takeLevels().clipped;
+            takes++;
+        }
+    });
+    run(sound);
+    done.store(true, std::memory_order_release);
+    taker.join();
+    total += sound.takeLevels().clipped;
+    CHECK_EQ(takes > 0, true);
+    CHECK_EQ(total, (uint64_t)expected);
+}
 
 void testJournal() {
     printf("midi: journal replay gives the same samples\n");
@@ -1538,6 +1628,8 @@ int main() {
     testFrom68000();
     testTxInterrupt();
     testJournal();
+    testMixSaturates();
+    testLevelsFromAnotherThread();
     testState();
     testStream();
     testSf2();

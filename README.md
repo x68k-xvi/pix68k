@@ -130,6 +130,7 @@ IPL ROM、CGROM、ディスクのイメージは zip にもリポジトリにも
 | `syslog` | `アドレス:ポート` | なし | ログを UDP の syslog で送る先 (ポートを省くと 514) | - |
 | `keyboard` | `auto`、`usb`、`pi400us`、`pi400jp` | `auto` | キーボードの種類。`auto` は VID:PID から決める ([keyboard.md](docs/keyboard.md)) | - |
 | `hat` | `auto`、`0`、`1` | `auto` | ゲームパッドのハットの値の範囲を 0-7 / 1-8 に固定する | - |
+| `pad_log` | `on`、`off` | `off` | ゲームパッドのボタンとハットの生の値が変わるたびにログに出す (配置の分からないゲームパッドの並びを調べるため。調べ終えたら `off` に戻す) | - |
 | `video_scale` | `off`、`integer`、`aspect`、`full` | ベアメタル版 `integer`、ホスト版 `aspect` | 画面の拡大の仕方 (下の「画面の出し方」) | ○ |
 | `video_filter` | `scanline`、`curve`、`mask`、`cz-600de`、`cz-600db` を `,` で並べる。`none` | `none` | ブラウン管のように見せる効果と、モニタの枠 (同上) | ○ |
 | `osd` | `on`、`fps`、`off` | `on` | 画面の右上に fps、速さ、温度、IP アドレスなどを出す。ベアメタル版は余白が足りなければ `on` でも画面に重ねる。ホスト版は `fps` のときだけ重ねる | ○ |
@@ -260,6 +261,7 @@ SD カードのルートの `cmdline.txt` に書く。主なもの:
 ## 操作
 
 - 設定メニュー: Scroll Lock、Application (メニューのキー)、Menu のどれかで開く / 閉じる。Raspberry Pi 400 はラズベリーのキー + M、ホスト版は F12 でも開く。
+  ゲームパッドでは Home か、Select を押しながら上で開く / 閉じる (ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド)。中では十字キーで選び、A で決め、B で戻る / 閉じる。
   FD の入れ替え、CD-ROM の入れ替え、機種と拡張ボードの選択、ステートの保存と読み込み、リセット、設定の保存ができる。
   開いている間は X68000 を止める ([settings-menu.md](docs/settings-menu.md))
 - Ctrl + Alt + Delete: 書き戻していないディスクと SRAM を書いてから Raspberry Pi を再起動する。
@@ -268,6 +270,7 @@ SD カードのルートの `cmdline.txt` に書く。主なもの:
   USB キーボードは 4 台までいっしょに使える
 - Raspberry Pi 400: 本体のキーボードは、ラズベリーのキーを押している間ほかのキーを X68000 にしかないキーに置き換える (ラズベリー + 1〜5 が XF1〜XF5 など)
 - マウスとゲームパッド: USB マウスは X68000 のマウス、USB ゲームパッドはジョイスティック 1、2 になる。
+  ゲームパッドの Start と Select を同時に押すと、X68000 をリセットする (設定メニューの Reset と同じ。ベアメタル版では、Circle が配置を知っているゲームパッドか、pix68k の表にあるゲームパッド (今は HORIPAD S だけ) で使える)
   ホスト版では、ウィンドウの中を左クリックするとマウスを取り込み、中ボタンのクリックか Ctrl + Alt で戻す ([build-and-test.md](docs/build-and-test.md))
 
 ## ネットワークの口
@@ -336,6 +339,55 @@ cmake --build build -j
 
 Linux (Ubuntu) では `sudo apt install build-essential cmake ninja-build libsdl2-dev python3` を入れると同じ手順でビルドできる。
 ctest、速さの測り方 (`bench`、`machine_bench`)、CI は [build-and-test.md](docs/build-and-test.md) にある。
+
+### RetroArch / libretro (開発中)
+
+現在は 68000 / メモリ 2MB / 標準音源 (FPU ボードなし) で XDF / DIM / D88 の FD と SASI の HDF から起動できる。
+ROM は RetroArch の System ディレクトリ内の `pix68k/IPLROM.DAT` (128KB) と `pix68k/CGROM.DAT` (768KB) に置く
+(小文字のファイル名も使える)。コンテンツなしでコアを起動すると、IPL ROM だけで起動する。
+
+```sh
+cmake -S . -B build/libretro -DPIX68K_HOST=OFF -DPIX68K_LIBRETRO=ON
+cmake --build build/libretro --target pix68k_libretro libretro_api_test libretro_runtime_test -j
+ctest --test-dir build/libretro -R '^libretro_' --output-on-failure
+```
+
+SDL2 は不要。出力は macOS では `pix68k_libretro.dylib`、Linux では `pix68k_libretro.so`。
+`PIX68K_HOST=ON` と併用すれば SDL2 版も作れる。RetroArch の「コアをロード」から読み込むか、
+`retroarch -L build/libretro/pix68k_libretro.so disk.xdf` で起動する (macOS では `.dylib`)。
+一緒にできる `pix68k_libretro.info` を RetroArch の「コア情報」のディレクトリに置くと、名前と必要な ROM が表示される。
+Core Options で 2MB / 12MB、16MHz / 10MHz、RTC の開始時刻を選ぶ。変更はコンテンツの再ロードで反映する。
+RTC の `fixed` は地方時 2023-11-14 22:13:20 (1700000000 秒) から始める。既定の `host` は現在の地方時。
+
+キーボードは PC のキーに相当する USB HID に変換する。F11 / F12 は XF1 / XF2、Alt は XF1 / XF5、
+Windows / Command は OPT.1 / OPT.2。ゲームパッドの十字キーと B / A は ATARI の方向とトリガ A / B になり、
+2 ポート使える。マウスは相対移動と左右ボタンを渡す。SRAM は RetroArch の SAVE_RAM として保存・復元する。
+Core Options のパッド補助を有効にすると、L＋ボタンでキー入力、右スティックでマウス操作ができる。
+通常版は既定で無効、Vita版は有効。[操作表](libretro/vita/README.md#パッドでキーマウスを操作) を参照。
+
+複数枚の FD は `.m3u` に 1 行 1 ファイルで書く (プレイリストからの相対パスも使える。最大 64 枚)。
+先頭 2 枚を FD0 / FD1 に入れる。交換するときは Core Options の `Disk Control target drive` で FD0 / FD1 を選び、
+RetroArch のディスク操作で「取り出す → イメージを選ぶ → 挿入する」の順に操作する。
+HDF は SASI ID 0 に接続する。HDF と M3U 内の FD の同時指定はまだできない。
+
+ディスクは既定で書込み禁止。`Disk writes` を `save-copy` にしてコンテンツを読み直すと、
+RetroArch の保存先内の `pix68k-media` に変更したイメージを保存する。元イメージは読み取るだけで変更しない。
+ファイル名は元パスと元データから決めるので、同名の別ゲームや元データを交換したものと保存が混ざらない。
+同じ元パス・データで次に起動すると保存コピーを使う。コピーの拡張子は `.pxm` とし、ゲーム一覧への混入を避ける。最後の書込みから約 2 秒間変更がない媒体を保存し、排出時・終了時にも保存する。
+保存時は全イメージを同期して書き出すため、大きい HDF や遅い保存先では一時停止が生じる場合がある。
+保存失敗は通知し、実行中は変更を保持して再試行する。FD は各 8MB / 合計 128MB、HDF は 256MB まで。
+ステートは RetroArch の保存・復元から使える。CPU・メモリ・周辺機器に加え、画面バッファ、音の補間位置と未送信音声、
+押下中のキー、FD0 / FD1 の挿入状態を保存する。RAM の使用量が増えても必要なバッファ容量は増えない。
+ディスクの中身はステートに含めない。一覧や内容が保存時と異なる場合は、現在の実行状態を変えずに復元を断る。
+設定 (RAM / クロック) や ROM が異なる場合も同様。RetroArch 用ステートは、表示・入力の情報を加えたラッパー形式。
+巻戻し・runahead・netplay の実用性はまだ検証していない。
+画面の解像度と周期は CRTC の設定に合わせ、音は 48kHz のステレオで出す。
+共有ライブラリを実際にロードする API 試験、合成 ROM の画面モード変更・音・入力の比較試験は ROM なしで動く。
+IPL ROM / CGROM と Human68k の起動ディスク (`~/.cache/pix68k`) があれば、2MB / 16MHz と 12MB / 10MHz で
+各 1000 フレーム動かして `DIR` を打ち、直接動かした共通コアと画面・音・RAM が一致するかも調べる。
+ROM とディスクは検証用ディレクトリにコピーして使い、元ファイルは変えない。
+RetroPie 用の独立モジュールと導入手順は [retropie/README.md](retropie/README.md)。
+64bit Linux が対象。Vita 向けの静的ビルドは [libretro/vita/README.md](libretro/vita/README.md) (開発中)。
 
 ## 資料
 

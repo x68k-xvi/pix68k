@@ -89,8 +89,9 @@ public:
     // 音量 (Munt の setOutputGain() と setReverbOutputGain()。1.0 で Munt の既定)
     void setGain(float gain);
     // 長すぎて捨てたシステムエクスクルーシブと、待ち行列が満杯で捨てたメッセージの数
-    uint32_t droppedSysex() const { return droppedSysex_; }
-    uint32_t droppedMessages() const { return droppedMessages_; }
+    // ほかのコアやスレッドからログ用に読んでよい (音を作る側が数えるので、読むのも足すのもアトミックにする)
+    uint32_t droppedSysex() const { return __atomic_load_n(&droppedSysex_, __ATOMIC_RELAXED); }
+    uint32_t droppedMessages() const { return __atomic_load_n(&droppedMessages_, __ATOMIC_RELAXED); }
     // 試験用: MT-32 のメモリ (システムエクスクルーシブのアドレス) を読む
     bool readMemory(uint32_t address, uint32_t length, uint8_t* out) const;
     // 試験用: 鳴っているパーシャルの数
@@ -139,8 +140,8 @@ private:
     bool sysexOver_ = false;
     int sysexLen_ = 0;
     uint8_t sysex_[SYSEX_MAX];
-    uint32_t droppedSysex_ = 0;
-    uint32_t droppedMessages_ = 0;
+    uint32_t droppedSysex_ = 0;    // 読むのは droppedSysex()、足すのは __atomic_fetch_add()
+    uint32_t droppedMessages_ = 0; // 読むのは droppedMessages()、足すのは __atomic_fetch_add()
 
     int pos_ = BLOCK;
     int16_t buf_[2 * BLOCK] = {};

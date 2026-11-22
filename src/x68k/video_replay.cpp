@@ -1,4 +1,5 @@
 #include "x68k/video_replay.h"
+#include "x68k/state.h"
 
 namespace x68k {
 
@@ -56,7 +57,8 @@ void VideoJournal::flush() {
 void RenderLink::attach(Machine& machine, VideoJournal& journal, Video& shadow, const VideoReplayer& reader) {
     Video& live = machine.video();
     live.setJournal(nullptr);
-    shadow = live;
+    shadow.setJournal(nullptr);
+    copyVideoState(live, shadow);
     journal_ = &journal;
     reader_ = &reader;
     frames_ = reader.frames();

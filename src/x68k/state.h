@@ -8,7 +8,7 @@
 //
 // 形式 (数値はすべてリトルエンディアン):
 //   +0   "PIX68KST" (8 バイト)
-//   +8   版 (STATE_VERSION)。違う版は読まない (版 2 は、拡張ボードのない Machine にだけ読む。版 3 から版 15 も読む。
+//   +8   版 (STATE_VERSION)。違う版は読まない (版 2 は、拡張ボードのない Machine にだけ読む。版 3 から版 17 も読む。
 //        版 11 までの SASI と SPC の状態は読み飛ばす)
 //   +12  ヘッダの大きさ (HEADER_SIZE)
 //   +16  CPU の種類 (m68k::CpuModel の値)、+20 メイン RAM、+24 ハイメモリ、+28 ローカルメモリ (バイト)、
@@ -16,7 +16,7 @@
 //   +44  外付け SCSI ボードの ROM の CRC-32 (ボードがなければ 0)
 //   +48  中身の大きさ (64 ビット)、+56 中身の CRC-32、
 //   +60  つないでいる拡張ボード (bit0 数値演算プロセッサボード、bit1 まーきゅりーゆにっと、bit2 Neptune-X、bit3 MIDI ボード、
-//        bit4 2 枚目の数値演算プロセッサボード (版 16 から))
+//        bit4 2 枚目の数値演算プロセッサボード (版 16 から)、bit5 TS-6BGA、bit6 TS-6BGA が $EF0000 (版 17 から))
 //   +64  中身 (各部の状態を決まった順に並べたもの。メモリは 4KB ごとに、全部 0 なら省く)
 // 機種、メモリの大きさ、クロック、ROM (IPL、内蔵 SCSI、外付け SCSI ボード)、拡張ボードのどれかが違えば読まない (Machine を作り直してから読むこと)。
 //
@@ -40,7 +40,7 @@ class Machine;
 class Sound;
 class Video;
 
-static constexpr uint32_t STATE_VERSION = 16; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
+static constexpr uint32_t STATE_VERSION = 18; // 3: 拡張ボード (+60 と、中身の最後のボードの状態) を足した
                                              // 4: SPC の、TEMP に入れるバイトの読み込みを待っているか (Spc::tempPending_)
                                              // 5: 68000 の速さを変えて動かしたときの時間の端数 (Machine::speedFrac_)
                                              // 6: 68000 のバスのウェイトと DRAM リフレッシュの端数 (Machine の TIME の最後)
@@ -62,6 +62,8 @@ static constexpr uint32_t STATE_VERSION = 16; // 3: 拡張ボード (+60 と、�
                                              //     1/12800 サイクル (Cpu020::SUB) になった。14 までは読むときに 16 倍する
                                              // 16: 2 枚目の数値演算プロセッサボード ($E9E080)。+60 の bit4 と、中身の "FPU2"
                                              //     (1 枚目の "FPUB" の次。2 枚目があるときだけ)。0 枚か 1 枚なら並びは 15 と同じ
+// 18: TS-6BGA の BitBLT host 転送の途中の入力位置とDWORD FIFO。
+// 17: TS-6BGA の VRAM とレジスタ、+60 の bit5 (接続) と bit6 ($EF0000)。
 static constexpr uint32_t STATE_REWRITTEN_SCSI = 12;
 static constexpr uint32_t STATE_REWRITTEN_ADPCM = 13;
 static constexpr uint32_t STATE_SCC_RS232C = 14;
@@ -108,6 +110,8 @@ constexpr uint64_t stateKeptTime(uint64_t t, uint64_t limit, uint64_t past) {
 
 // 保存に要るバイト数 (このあと Machine を動かさずに saveState() を呼べば、この大きさになる)
 size_t stateSize(Machine& m);
+// ゼロページを省かない場合の上限。同じ機種・接続機器のままなら、実行中に増えない。
+size_t stateSizeBound(Machine& m);
 // out (cap バイト) に書く。足りなければ false
 // version は試験用 (古い版の並びで書く。2 以上 STATE_VERSION 以下。版 11 までの SASI と SPC の状態は、バスフリーの形で書く)
 bool saveState(Machine& m, uint8_t* out, size_t cap, size_t& written, uint32_t version = STATE_VERSION);
@@ -142,6 +146,7 @@ public:
     bool applying() const { return mode_ == LOAD; }
     bool ok() const { return ok_; }
     size_t pos() const { return pos_; }
+    void countFullMemory() { fullMemory_ = true; }
     void fail() { ok_ = false; }
     // 理由を付けて読むのをやめる (loadState() のエラーの文になる。最初の理由だけを残す)
     void fail(const char* why) {
@@ -221,6 +226,7 @@ private:
     bool ok_ = true;
     const char* why_ = nullptr;
     uint64_t timeShift_ = 0;
+    bool fullMemory_ = false;
 };
 
 } // namespace x68k

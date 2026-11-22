@@ -49,6 +49,7 @@
 #include "x68k/mercury.h"
 #include "x68k/midi_out.h"
 #include "x68k/neptune.h"
+#include "x68k/ts6bga.h"
 #include "x68k/ym3802.h"
 #include "x68k/fdd.h"
 #include "x68k/hdd.h"
@@ -396,6 +397,7 @@ public:
     // 設定で有効にしたときのメモリの容量の 4 バイトと、060turbo のキャッシュの設定の 1 バイトだけで、
     // メモリの容量を書き換えたときは sramDirty() が true になる (machine.cpp の powerOn() を参照)
     uint8_t* sram() { return sram_; }
+    uint8_t* mainRam() { return ram_; }
     bool sramDirty() const { return sramDirty_; }
     void clearSramDirty() { sramDirty_ = false; }
     // フロッピーディスク: イメージは環境が持ち、ここは指すだけ (drive は 0..3)
@@ -450,6 +452,8 @@ public:
     // IRQ2 (ベクタ $F9) で割り込む。フレームの送受信の口は neptune()->setLink() で渡す。確保できなければ false
     bool setNeptune(bool on);
     Neptune* neptune() { return neptune_; }
+    bool setTs6bga(bool on, uint32_t base = 0xee0000);
+    Ts6bga* ts6bga() { return ts6bga_; }
     // MIDI ボード CZ-6BM1 (x68k/ym3802.h)。つなぐと $EAFA01-$EAFA0F の奇数番地に YM3802 が見え、IRQ4 で割り込む。
     // 送り終えたバイトは Sound を通して setMidiOut() の音源に届く (音の合成を別のコアで行うときは、そのコアの音源)。
     // 確保できなければ false
@@ -529,8 +533,13 @@ public:
     void setSerialLink(SerialLink* link) { scc_.setLink(link); }
     Ppi& ppi() { return ppi_; }
     uint32_t cpuHz() const { return config_.cpuHz; }
+    // フロントエンドに通知する CRTC の周期。HRL のドットクロックの切替も反映する。
+    double frameRate() const {
+        return (double)video_->dotClock(sysPort_.hrl()) / video_->horizontalTotalDots() / video_->verticalTotal();
+    }
     const Config& config() const { return config_; }
     const uint8_t* iplRom() const { return ipl_; }
+    const uint8_t* cgRom() const { return cg_; }
     const uint8_t* scsiRom() const { return scsiRom_; }     // 内蔵 SCSI の ROM (なければ nullptr)
     const uint8_t* scsiExRom() const { return scsiExRom_; } // 外付け SCSI ボードの ROM (なければ nullptr)
     uint64_t frameCount() const { return frames_; }
@@ -744,6 +753,7 @@ private:
     // 数値演算プロセッサボードとまーきゅりーゆにっと (つないだときだけ。上と同じ理由で最後に置く)
     FpuBoard* fpuBoards_[FpuBoard::MAX_BOARDS] = {}; // [0] が $E9E000、[1] が $E9E080
     Mercury* mercury_ = nullptr;
+    Ts6bga* ts6bga_ = nullptr;
     Neptune* neptune_ = nullptr; // ネットワークボード (つないだときだけ。上と同じ理由で最後に置く)
     Ym3802* midi_ = nullptr;      // MIDI ボード (つないだときだけ。上と同じ理由で最後に置く)
     MidiOut* midiOut_ = nullptr;  // MIDI の音源

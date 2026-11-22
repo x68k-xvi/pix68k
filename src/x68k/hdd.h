@@ -64,6 +64,7 @@ public:
     uint64_t bytes() const { return (uint64_t)blockCount_ * blockBytes_; }
     bool writeProtected() const { return readOnly_; }
     bool dirty() const { return dirty_.any(); }
+    uint32_t writeCount() const { return dirty_.writes(); }
     void clearDirty() { dirty_.clearAll(); }
     // イメージの off バイト目 / [off, off + len) を書いた
     void markDirty(uint64_t off) { dirty_.mark(off); }

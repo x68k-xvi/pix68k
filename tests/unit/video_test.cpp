@@ -10,8 +10,10 @@
 #include "test_check.h"
 #include "x68k/machine.h"
 #include "x68k/render.h"
+#include "x68k/state.h"
 #include "x68k/video.h"
 #include "x68k/video_replay.h"
+#include "../../libretro/vita/paletted_frame.h"
 
 namespace {
 
@@ -682,6 +684,7 @@ void testSprite() {
     S.sprite(5, 22, 30, 0x0501, 3);
     CHECK_EQ(S.at(22, 30), S.T(0x33));
     // 番号の大きいスプライトが優先度 3 でも、番号の小さいスプライトの透明なドットの所には出る
+    CHECK_EQ(S.at(35, 30), S.T(0x5e));
     CHECK_EQ(S.at(36, 30), S.T(0x5f));
     // BG コントロールの bit9 が 0 なら出ない。768 ドットの画面でも出ない
     S.sp16(0x808, 0x0000);
@@ -713,6 +716,49 @@ void testSpriteLimit() {
     for (int n = 0; n < 32; n++) S.sprite(n, -16, 50, 0x0101, 3);
     S.r.renderLine(50);
     CHECK_EQ(S.px[50 * Renderer::MAX_WIDTH + 32 * 8], S.T(0));
+}
+
+void testSpriteRowsAfterCopy() {
+    S.init();
+    S.vc(2, 0x0040);
+    S.pcg8(4, 0, 0x10000000);
+    S.sprite(0, 10, 20, 0x0301, 3);
+    CHECK_EQ(S.at(10, 20), S.T(0x31));
+    static Video saved;
+    x68k::copyVideoState(S.v, saved);
+    S.sprite(0, 10, 40, 0x0301, 3);
+    CHECK_EQ(S.at(10, 20), S.T(0));
+    CHECK_EQ(S.at(10, 40), S.T(0x31));
+    x68k::copyVideoState(saved, S.v);
+    CHECK_EQ(S.at(10, 20), S.T(0x31));
+    CHECK_EQ(S.at(10, 40), S.T(0));
+}
+
+void testSpriteRowBounds() {
+    S.init();
+    S.vc(2, 0x0040);
+    S.crtc(20, 0x0019); // Interlaced 1024-line surface.
+    S.sp16(0x810, 0x0019);
+    for (int row = 0; row < 8; row++) {
+        S.pcg8(4, row, 0x11111111);
+        S.pcg8(5, row, 0x11111111);
+    }
+    for (int y = 1020; y <= 1023; y++) {
+        S.sprite(0, 0, y - 16, 0x0301, 3);
+        CHECK_EQ(S.at(0, y - 17), S.T(0));
+        CHECK_EQ(S.at(0, y - 16), S.T(0x31));
+        CHECK_EQ(S.at(0, y - 1), S.T(0x31));
+        CHECK_EQ(S.at(0, y), S.T(0));
+    }
+    S.init();
+    S.vc(2, 0x0040);
+    S.pcg8(4, 0, 0x10000000);
+    S.sprite(0, 0, -16, 0x0301, 3); // Raw Y=0.
+    S.sp16(0x80e, 0x38); // At display y=0, sprite scanline is -16.
+    CHECK_EQ(S.at(0, 0), S.T(0x31));
+    S.sp16(0x80e, 0x39); // Scanline -17 has no sprite candidates.
+    CHECK_EQ(S.at(0, 0), S.T(0));
+    CHECK_EQ(S.at(0, 1), S.T(0x31));
 }
 
 void testBg() {
@@ -1418,9 +1464,81 @@ void testJournalReplay() {
     CHECK_EQ(sameLines(0, kSpecial), 0);
 }
 
+// Compare the canonical pixels after GPU capture against the established CPU
+// compositor, including opaque palette zero and black nonzero color codes.
+void testIndexedCapture() {
+    pix68k_retro::PalettedFrame frame;
+    frame.skipSoftware = true;
+    unsigned captured = 0, fallback = 0;
+    for (int mode : {0, 1, 3}) for (int zero : {0, 1}) {
+        S.init();
+        S.crtc(20, (uint16_t)((mode << 8) | 0x15));
+        S.vc(0, (uint16_t)mode);
+        S.palette(256, zero ? Screen::tcolor(0) : 0);
+        S.palette(256 + 5, 0); // A nonzero code may map to transparent black.
+        S.pcg8(4, 0, 0x33550000);
+        S.sprite(0, 4, 4, 0x0401, 3);
+        for (int x = 0; x < 32; x++) {
+            S.tdot(x, 4, x % 4 == 0 ? 5 : x % 3);
+            S.gword(x, 4, (uint16_t)(x % 7));
+        }
+        for (int ranks = 0; ranks < 64; ranks++) for (int enable : {0, 0x20, 0x40, 0x60, 0x6f, 0x406f, 0x146f}) {
+            S.vc(1, (uint16_t)((ranks << 8) | 0xe4));
+            S.vc(2, (uint16_t)enable);
+            S.r.setIndexedLineSink(nullptr);
+            S.r.renderLine(4);
+            uint32_t expected[512];
+            memcpy(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected);
+            std::fill(S.px + 4 * Renderer::MAX_WIDTH, S.px + 4 * Renderer::MAX_WIDTH + 512, kUntouched);
+            S.r.setIndexedLineSink(&frame);
+            S.r.renderLine(4);
+            if (frame.supported[4]) {
+                captured++;
+                CHECK_EQ(S.px[4 * Renderer::MAX_WIDTH], kUntouched);
+            } else fallback++;
+            frame.resolve(S.px, 512, 5);
+            CHECK_EQ(memcmp(expected, S.px + 4 * Renderer::MAX_WIDTH, sizeof expected), 0);
+        }
+        S.r.setIndexedLineSink(nullptr);
+    }
+    CHECK_EQ(captured > 0, true);
+    CHECK_EQ(fallback > 0, true);
+    // Preserve previously drawn columns when the display becomes narrower.
+    uint8_t codes[16] = {}; uint32_t colors[256] = {};
+    colors[1] = 0x123456; codes[12] = 1;
+    frame.software = S.px;
+    frame.above(7, 16, codes, nullptr, colors, nullptr);
+    S.px[7 * Renderer::MAX_WIDTH + 12] = kUntouched;
+    frame.beginLine(7, 8);
+    CHECK_EQ(S.px[7 * Renderer::MAX_WIDTH + 12], 0x123456);
+    CHECK_EQ(frame.supported[7], 0);
+    // Captured palettes are snapshots, independent of later register writes.
+    frame.above(8, 16, codes, nullptr, colors, nullptr);
+    colors[1] = 0;
+    frame.resolve(S.px, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
+    CHECK_EQ(S.px[8 * Renderer::MAX_WIDTH + 12], 0x123456);
+    colors[1] = 0x123456;
+    frame.above(20, 16, codes, nullptr, colors, nullptr);
+    const auto serialA = frame.paletteSerial[20];
+    frame.above(21, 16, codes, nullptr, colors, nullptr);
+    CHECK_EQ(frame.paletteSerial[21], serialA);
+    colors[1] = 0x654321;
+    frame.above(22, 16, codes, nullptr, colors, nullptr);
+    CHECK_EQ(frame.paletteSerial[22] != serialA, true);
+    colors[1] = 0x123456;
+    frame.above(23, 16, codes, nullptr, colors, nullptr);
+    CHECK_EQ(frame.paletteSerial[23] != serialA, true);
+    frame.resolve(S.px, Renderer::MAX_WIDTH, Renderer::MAX_HEIGHT);
+    CHECK_EQ(S.px[20 * Renderer::MAX_WIDTH + 12], 0x123456);
+    CHECK_EQ(S.px[22 * Renderer::MAX_WIDTH + 12], 0x654321);
+    frame.invalidate();
+    for (auto line : frame.supported) CHECK_EQ(line, 0);
+}
+
 } // namespace
 
 int main() {
+    testIndexedCapture();
     testPaletteColor();
     testTextVram();
     testGraphicVram();
@@ -1433,6 +1551,8 @@ int main() {
     testGraphic1024Screen();
     testSprite();
     testSpriteLimit();
+    testSpriteRowsAfterCopy();
+    testSpriteRowBounds();
     testBg();
     testSpritePosition();
     testLayerPriority();

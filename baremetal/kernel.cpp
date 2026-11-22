@@ -1058,18 +1058,31 @@ void CKernel::UpdateUsbDevices() {
         if (slot < 0) break;
         m_PadIndex[slot] = n - 1;
         m_PadKnown[slot] = (pad->GetProperties() & GamePadPropertyIsKnown) != 0;
+        unsigned vid = 0, pid = 0;
+        CUSBDevice* dev = pad->GetDevice();
+        const TUSBDeviceDescriptor* desc = dev ? dev->GetDeviceDescriptor() : nullptr;
+        if (desc != nullptr) {
+            vid = desc->idVendor;
+            pid = desc->idProduct;
+        }
+        // 状態の通知 (USB の割り込み) が読むので、登録する前に決める
+        m_PadLayout[slot] = m_PadKnown[slot] ? nullptr : platform::findPadLayout((uint16_t)vid, (uint16_t)pid);
         m_LastPadButtons[slot] = 0;
+        m_LastPadHat[slot] = -2;
         m_PadWant[slot] = 0;
         m_PadSent[slot] = -1;
         m_PadHat[slot].reset(HatBase(pad, m_PadKnown[slot]));
+        m_PadReset[slot].reset();
+        m_PadMenu[slot].reset();
         m_pGamePad[slot] = pad;
         m_PadAttachTicks[slot] = CTimer::GetClockTicks64();
         m_BootPadBits[slot] = 0; // 起動の組み合わせのメニュー (boot_menu.cpp の PadStartFilter)
         m_BootPadReports[slot] = 0;
         pad->RegisterRemovedHandler(GamePadRemovedHandler);
         pad->RegisterStatusHandler(GamePadStatusHandler);
-        m_Logger.Write(FromKernel, LogNotice, "gamepad attached (%s, joystick %d%s)", (const char*)name, slot + 1,
-                       m_PadKnown[slot] ? "" : ", unknown layout");
+        m_Logger.Write(FromKernel, LogNotice, "gamepad attached (%s, %04x:%04x, joystick %d%s%s)", (const char*)name, vid,
+                       pid, slot + 1, m_PadKnown[slot] ? "" : m_PadLayout[slot] ? ", layout " : ", unknown layout",
+                       m_PadLayout[slot] ? m_PadLayout[slot]->name : "");
     }
 }
 
@@ -1208,29 +1221,71 @@ void CKernel::GamePadStatusHandler(unsigned index, const TGamePadState* state) {
     for (int s = 0; s < 2; s++)
         if (k->m_pGamePad[s] != nullptr && k->m_PadIndex[s] == index) slot = s;
     if (slot < 0) return;
-    if (k->m_pEmulator != nullptr || k->m_BootMenuActive) {
-        platform::GamePadInput in;
-        in.known = k->m_PadKnown[slot];
-        in.buttons = state->buttons;
-        in.nhats = state->nhats;
-        in.hat = state->nhats > 0 ? k->m_PadHat[slot].decode(state->hats[0]) : 8;
-        in.naxes = state->naxes;
-        for (int a = 0; a < 2 && a < state->naxes; a++) {
-            in.value[a] = state->axes[a].value;
-            in.minimum[a] = state->axes[a].minimum;
-            in.maximum[a] = state->axes[a].maximum;
-        }
-        if (k->m_pEmulator == nullptr) { // 起動の組み合わせのメニュー (boot_menu.cpp)
-            k->m_BootPadBits[slot] = platform::joystickBits(in);
-            k->m_BootPadReports[slot] = k->m_BootPadReports[slot] + 1;
+    // pad_log=on: ボタンとハットの生の値が変わったらログに出す (配置の分からないゲームパッドの並びを調べるため)
+    const int rawHat = state->nhats > 0 ? state->hats[0] : -1;
+    if (k->m_PadLog && (state->buttons != k->m_LastPadButtons[slot] || rawHat != k->m_LastPadHat[slot])) {
+        k->m_LastPadButtons[slot] = state->buttons;
+        k->m_LastPadHat[slot] = rawHat;
+        k->m_Logger.Write(FromKernel, LogNotice, "gamepad %d: buttons=%X hat=%d", slot + 1, state->buttons, rawHat);
+    }
+    // VID:PID で並びの分かるゲームパッド (platform::findPadLayout()) は、Circle が配置を知っているものと同じビットに並べ直す
+    const platform::PadLayout* layout = k->m_PadLayout[slot];
+    platform::GamePadInput in;
+    in.known = k->m_PadKnown[slot] || layout != nullptr;
+    in.buttons = layout != nullptr ? platform::remapPadButtons(*layout, state->buttons) : state->buttons;
+    // Start + Select (X68000 のリセット)。X68000 を動かす前と、設定メニューを開いている間は扱わない。その間も状態は見ておき、
+    // 押したまま X68000 が動き出したり、メニューを閉じたりしても、両方を離して押し直すまではリセットしない
+    const bool reset =
+        k->m_PadReset[slot].update(in.known, in.buttons) && k->m_pEmulator != nullptr && !k->m_MenuActive;
+    if (reset) __atomic_store_n(&k->m_PadResetRequested, true, __ATOMIC_RELEASE);
+    in.nhats = state->nhats;
+    in.hat = state->nhats > 0 ? k->m_PadHat[slot].decode(state->hats[0]) : 8;
+    in.naxes = state->naxes;
+    for (int a = 0; a < 2 && a < state->naxes; a++) {
+        in.value[a] = state->axes[a].value;
+        in.minimum[a] = state->axes[a].minimum;
+        in.maximum[a] = state->axes[a].maximum;
+    }
+    const u8 bits = platform::joystickBits(in);
+    // 設定メニューを開く / 操作する (platform::PadMenuInput)。X68000 を動かす前も、押しているボタンは追っておく
+    // (押したまま X68000 が動き出しても、離して押し直すまでは開かない)
+    u8 out = 0, events[platform::PadMenuInput::MAX_EVENTS];
+    int nEvents = 0;
+    const platform::PadMenuInput::Result r =
+        k->m_PadMenu[slot].update(in.known, in.buttons, bits, k->m_pEmulator == nullptr || k->m_MenuActive, out, events,
+                                  nEvents);
+    if (k->m_pEmulator == nullptr) k->m_PadMenu[slot].forgetHeld(); // 設定メニューの繰り返しには使わない
+    if (k->m_pEmulator != nullptr) {
+        switch (r) {
+        case platform::PadMenuInput::OPEN: {
+            // 同じレポートで Start + Select も押していたら、リセットだけにする (ホスト版の platform::PadPairInput と同じ)
+            if (reset) return;
+            // キーボードのメニューのキーと同じく、押しているキーを離したことにしてから、主ループがコア 1 を止めて開く。
+            // ジョイスティックは OpenMenu() が離したことにする
+            Emulator* emu = k->m_pEmulator;
+            k->m_PadWant[slot] = 0;
+            k->m_Keys.releaseAll([emu](uint8_t u, bool d) { return emu->keyEvent(u, d); });
+            k->m_MenuActive = true;
             return;
         }
-        k->m_PadWant[slot] = platform::joystickBits(in);
-        // 設定メニューを開いている間は送らない (閉じたあとに主ループが送る)
-        if (!k->m_MenuActive) k->SendGamePad(slot);
+        case platform::PadMenuInput::MENU:
+            // 設定メニューを開いている間は X68000 に送らない。閉じたときに押していたものは、離すまで送らない
+            k->m_PadWant[slot] = 0;
+            for (int i = 0; i < nEvents; i++) k->PushMenuKey(events[i]);
+            return;
+        case platform::PadMenuInput::PASS:
+            k->m_PadWant[slot] = out;
+            k->SendGamePad(slot);
+            return;
+        }
         return;
     }
-    if (state->buttons == k->m_LastPadButtons[slot]) return;
+    if (k->m_BootMenuActive) { // 起動の組み合わせのメニュー (boot_menu.cpp)
+        k->m_BootPadBits[slot] = bits;
+        k->m_BootPadReports[slot] = k->m_BootPadReports[slot] + 1;
+        return;
+    }
+    if (k->m_PadLog || state->buttons == k->m_LastPadButtons[slot]) return;
     k->m_LastPadButtons[slot] = state->buttons;
     k->m_Logger.Write(FromKernel, LogNotice, "gamepad %u: buttons=%X", index, state->buttons);
 }
@@ -1241,6 +1296,8 @@ void CKernel::GamePadRemovedHandler(CDevice* device, void*) {
     for (int s = 0; s < 2; s++) {
         if (k->m_pGamePad[s] != (CUSBGamePadDevice*)device) continue;
         k->m_pGamePad[s] = nullptr;
+        k->m_PadReset[s].reset();
+        k->m_PadMenu[s].reset();
         k->m_BootPadBits[s] = 0; // 起動の組み合わせのメニューで、離したことにする
         if (k->m_pEmulator != nullptr) {
             // ジョイスティックを離したことにする

@@ -75,6 +75,9 @@ public:
     // ---- 読み手 (音を出す側) ----
     // たまっている分を返す (足りなくても埋めない)。WAV に書くときなど
     int drain(int16_t* out, int maxFrames);
+    // 読み手・書き手を止めているときだけ使う、フロントエンドのステート用。
+    int copyPending(int16_t* out, int maxFrames) const;
+    void clearStopped();
     // platform::AudioSource: いつも frames フレームを返す。最初と、足りなくなったあとは、
     // prebuffer フレームたまるまで待つ (その間と足りない分は、直前の値から 0 へ少しずつ近づける)
     void readAudio(int16_t* out, int frames) override;
@@ -141,6 +144,21 @@ public:
     // アトミックにする (target()、extra()、setExtra())。書くのは setLatency() と音を作る側だけ。setLatency() は、
     // 音を作り始める前に呼ぶ (ベアメタル版は音を作るコアを動かす前、ホスト版は SDL の音を始める前)
     unsigned latencyGoal() const { return target() + extra(); }
+    // 出力の大きさ (ログ用)。前に takeLevels() で取ってからの、
+    //   base:    MIDI の音源を足す前の音 (OPM、ADPCM、まーきゅりーゆにっと、CD-ROM 装置のオーディオ) の絶対値の最大
+    //   midi:    MIDI の音源が 1 フレームに足した量の絶対値の最大
+    //   clipped: 足して 16 ビットを超え、上限か下限で止めたフレームの数
+    // 音が割れるという報告のときに、振り切れているのか、どの音源が大きいのかを実機で見分けるためのもの。
+    // ほかのコアやスレッドから呼んでよい (音を作る側はアトミックに書く)。clipped は 1 つずつアトミックに足すので、
+    // 取るのと重なっても、消えることも 2 つの区間に入ることもない。最大は、取るのと重なった 1 フレームが次の区間に
+    // 入ることがある。3 つを同時には取らないので、区間の境目は 1 フレームほどずれる
+    struct Levels {
+        uint32_t base, midi, clipped;
+    };
+    Levels takeLevels() {
+        return {__atomic_exchange_n(&levelBase_, 0u, __ATOMIC_RELAXED), __atomic_exchange_n(&levelMidi_, 0u, __ATOMIC_RELAXED),
+                __atomic_exchange_n(&levelClipped_, 0u, __ATOMIC_RELAXED)};
+    }
     // 補間の刻みを、出力の周波数から決まる値よりどれだけ小さくしているか (千分率。大きくしているときは 0)。
     // 5 までは速さのずれの調整、それより大きければ間に合わない間の調整 (stretchIfLow())。音を作る側が読む (試験用)
     unsigned stretchPermille() const {
@@ -252,6 +270,14 @@ public:
     }
     Adpcm& adpcm() { return adpcm_; }
     AudioRing& ring() { return ring_; }
+    // 同期出力 (setLatency を使わない) のフロントエンドが、補間位置を保存・復元する。
+    uint32_t outputPosition() const { return pos_; }
+    bool restoreOutputPosition(uint32_t pos) {
+        if (target() || !baseStep_ || pos >= baseStep_) return false;
+        pos_ = pos;
+        step_ = baseStep_;
+        return true;
+    }
 
 private:
     void resetLocal();
@@ -274,6 +300,18 @@ private:
     void tuneLatency(); // 0.25 秒ごとに、足りなくなったかを見て目標に足す量を決める (sound.cpp)
     // 足りなくならない区間の数と、その間のたまり具合の最小値を初めの値に戻す
     void restartCalm() { calm_ = 0; calmMin_ = UINT16_MAX; }
+    // 出力の 1 フレームの大きさを記録する (takeLevels())。bl / br は MIDI の音源を足す前、l / r は足したあと (止める前)
+    void noteLevels(int32_t bl, int32_t br, int32_t l, int32_t r) {
+        const auto mag = [](int32_t a, int32_t b) {
+            const uint32_t x = (uint32_t)(a < 0 ? -(int64_t)a : a), y = (uint32_t)(b < 0 ? -(int64_t)b : b);
+            return x > y ? x : y;
+        };
+        const uint32_t base = mag(bl, br), midi = mag(l - bl, r - br);
+        if (base > __atomic_load_n(&levelBase_, __ATOMIC_RELAXED)) __atomic_store_n(&levelBase_, base, __ATOMIC_RELAXED);
+        if (midi > __atomic_load_n(&levelMidi_, __ATOMIC_RELAXED)) __atomic_store_n(&levelMidi_, midi, __ATOMIC_RELAXED);
+        if (l > 32767 || l < -32768 || r > 32767 || r < -32768)
+            __atomic_fetch_add(&levelClipped_, 1u, __ATOMIC_RELAXED); // 読んで足して書くと、取るのと重なったときに前の区間の数が残る
+    }
     // extra_ を書く (latencyGoal() をほかのコアが読むので、アトミックに書く)
     void setExtra(unsigned frames) { __atomic_store_n(&extra_, frames, __ATOMIC_RELAXED); }
     unsigned target() const { return __atomic_load_n(&target_, __ATOMIC_RELAXED); }
@@ -297,6 +335,7 @@ private:
     uint32_t adjustCount_ = 0;   // 0.25 秒の区切りまでに作ったフレーム数 (出力の周波数の 1/4 まで数えるので 32 ビット)
     // 次の 2 つは合わせて 4 バイト (前は minFill_ が 4 バイト。Sound の大きさと並びを変えない)。どちらも
     // たまり具合 (AudioRing::SIZE 以下) なので 16 ビットで足りる
+    uint32_t levelBase_ = 0, levelMidi_ = 0, levelClipped_ = 0; // takeLevels() の説明を参照 (ステートには入れない)
     uint16_t minFill_ = UINT16_MAX;  // 今の区間 (0.25 秒) のたまり具合の最小値
     uint16_t shortMin_ = UINT16_MAX; // この 1/32 秒のたまり具合の最小値 (stretchIfLow())
     unsigned extra_ = 0;         // 目標に足している量 (フレーム。読むときは extra()、書くときは setExtra())

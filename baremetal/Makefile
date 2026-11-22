@@ -8,7 +8,7 @@ PIX68K_SRC ?= ../src
 X68K_OBJS = x68k_machine.o x68k_mfp.o x68k_rtc.o x68k_video.o x68k_devices.o x68k_render.o x68k_gvram.o \
 	x68k_fdd.o x68k_fdc.o x68k_dmac.o x68k_keyboard.o x68k_textscreen.o x68k_sram_file.o \
 	x68k_scc.o x68k_mouse.o x68k_ppi.o x68k_sasi.o x68k_spc.o x68k_cd_drive.o x68k_opm.o x68k_adpcm.o x68k_sound.o x68k_video_replay.o x68k_sound_replay.o x68k_state.o \
-	x68k_fpu_board.o x68k_mercury.o x68k_neptune.o x68k_ym3802.o
+	x68k_ts6bga.o x68k_fpu_board.o x68k_mercury.o x68k_neptune.o x68k_ym3802.o
 
 # FPU の計算の部分 (FpuCore) は、68000 の機種の数値演算プロセッサボード (x68k/fpu_board.h) も使うので、常に入れる
 OBJS	= main.o mem_fast.o kernel.o emulator.o machine_run.o machine_menu.o boot_menu.o net_bridge.o host_net.o pi5_fan.o m68k.o m68k_fpu_core.o m68k_fpu_math.o $(X68K_OBJS) \

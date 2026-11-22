@@ -19,6 +19,9 @@
 // 受け渡しで、同じフレームを 2 回写すことも、抜けることもない: SELF にする前に take() で取ったものまではコア 0 が写し、
 // 受け渡し中に残っていたものと、SELF の間に描いたものは書き手が写し、CORE0 に戻ったあとに描いたものは、ふだんどおり
 // shared_ でコア 0 に渡す。ふだんの受け渡しでコア 0 が取る前に置き換わるもの (dropped()) は、これとは別にある。
+// retainSelfFrames() を起動前に指定した場合は、直接表示した最新フレームも shared_ に残す。
+// 読み手は end() のあと take() で受け取り、第2出力に使える。表示済みのフレームは dropped() に数えず、
+// 書き手も再表示しない。読み手がメインにも再表示した場合、その分は selfPresented() と重複する。
 // ベアメタルでも使えるよう、例外、RTTI、STL は使わない (ヘッダだけ)。
 #pragma once
 
@@ -28,11 +31,14 @@ namespace platform {
 
 class FrameHandoff {
 public:
+    // 起動前に設定。自分で表示したフレームも読み手へ渡し、第2出力がコピーなしで参照できるようにする。
+    void retainSelfFrames() { retainSelf_ = true; }
+
     // ---- 書き手 ----
     // いま描いているバッファの番号
     unsigned writer() const { return writer_; }
     // 描き終えたバッファ (writer()) を渡し、次に描くバッファの番号を返す。写す役を任されていれば、present(番号) を
-    // 呼んで自分で写し、同じバッファの番号を返す (写し終えているので上書きしてよい)
+    // 呼んで自分で写す。既定では同じ番号を返すが、retainSelfFrames() 指定時は shared_ と交換する
     template <class Present> unsigned publish(Present&& present) {
         unsigned mode = SELF;
         if (__atomic_load_n(&mode_, __ATOMIC_RELAXED) == SELF &&
@@ -41,7 +47,7 @@ public:
             // コア 0 が取らなかったフレームが受け渡し中に残っていれば、先にそれを写す。コア 0 は CORE0 に戻るまで
             // take() を呼ばないので、shared_ を書き換えてよい
             const unsigned pending = __atomic_load_n(&shared_, __ATOMIC_ACQUIRE);
-            if (pending & NEW_FRAME) {
+            if ((pending & NEW_FRAME) && !(pending & SELF_SHOWN)) {
                 present(pending & 3);
                 count(selfPresented_);
                 __atomic_store_n(&shared_, pending & 3, __ATOMIC_RELAXED); // 下の release で CORE0 より前に見える
@@ -52,6 +58,10 @@ public:
             count(presentSeq_); // 偶数に戻す
             // 写し終えたことを release で示す。コア 0 が戻すよう頼んでいたら (BUSY_HANDBACK) CORE0 にする
             __atomic_store_n(&latest_, (int)writer_, __ATOMIC_RELEASE);
+            if (retainSelf_) {
+                const unsigned old = __atomic_exchange_n(&shared_, writer_ | NEW_FRAME | SELF_SHOWN, __ATOMIC_ACQ_REL);
+                writer_ = old & 3;
+            }
             mode = BUSY;
             if (!__atomic_compare_exchange_n(&mode_, &mode, (unsigned)SELF, false, __ATOMIC_RELEASE,
                                              __ATOMIC_RELAXED))
@@ -60,7 +70,7 @@ public:
         }
         const unsigned old = __atomic_exchange_n(&shared_, writer_ | NEW_FRAME, __ATOMIC_ACQ_REL);
         // コア 0 が前のフレームを取る前に次のフレームを渡した (前のフレームは画面に出ない)
-        if (old & NEW_FRAME) count(dropped_);
+        if ((old & NEW_FRAME) && !(old & SELF_SHOWN)) count(dropped_);
         count(published_);
         __atomic_store_n(&latest_, (int)writer_, __ATOMIC_RELEASE);
         writer_ = old & 3;
@@ -132,7 +142,8 @@ public:
 
 private:
     enum : unsigned { CORE0 = 0, SELF = 1, BUSY = 2, BUSY_HANDBACK = 3 };
-    static constexpr unsigned NEW_FRAME = 4;
+    static constexpr unsigned NEW_FRAME = 4, SELF_SHOWN = 8;
+    bool retainSelf_ = false; // コア起動前にだけ設定
     static void count(uint32_t& n) { __atomic_store_n(&n, n + 1, __ATOMIC_RELAXED); } // 書き手だけが書く
 
     unsigned writer_ = 0, reader_ = 2;

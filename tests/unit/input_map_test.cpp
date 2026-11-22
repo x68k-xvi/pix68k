@@ -1,5 +1,6 @@
 // src/platform/input_map.h のテスト: USB マウスのレポートの溜め方 (送り先が満杯のとき、短いクリック)、
-// USB ゲームパッドの状態からジョイスティックのビットへの対応 (配置が分かるもの、ハット、アナログ軸の遊び)
+// USB ゲームパッドの状態からジョイスティックのビットへの対応 (配置が分かるもの、ハット、アナログ軸の遊び)、
+// ゲームパッドの Start + Select (リセット) の見つけ方、ゲームパッドでの設定メニューの操作
 #include <limits.h>
 
 #include "platform/input_map.h"
@@ -348,6 +349,322 @@ void testGamePad() {
     CHECK_EQ(platform::joystickBits(in), 0);
 }
 
+void testPadResetCombo() {
+    printf("gamepad Start + Select\n");
+    const unsigned START = 1u << 14, SELECT = 1u << 11, PLUS = 1u << 19, MINUS = 1u << 20, A = 1u << 9;
+    platform::PadResetCombo c;
+    CHECK_EQ(c.update(true, 0), 0);
+    // 片方だけでは何もしない
+    CHECK_EQ(c.update(true, START), 0);
+    CHECK_EQ(c.update(true, 0), 0);
+    CHECK_EQ(c.update(true, SELECT | A), 0);
+    // 別々のレポートで押しても、両方そろったときに 1 回
+    CHECK_EQ(c.update(true, SELECT | START), 1);
+    // 押しっぱなしでは 2 回目はない (ほかのボタンを押しても)
+    CHECK_EQ(c.update(true, SELECT | START), 0);
+    CHECK_EQ(c.update(true, SELECT | START | A), 0);
+    // 片方を離して押し直しても、両方を離すまでは受けない
+    CHECK_EQ(c.update(true, SELECT), 0);
+    CHECK_EQ(c.update(true, SELECT | START), 0);
+    // 両方を離せば、次を受ける
+    CHECK_EQ(c.update(true, A), 0);
+    CHECK_EQ(c.update(true, SELECT | START), 1);
+    CHECK_EQ(c.update(true, 0), 0);
+    // Switch Pro コントローラの + と -
+    CHECK_EQ(c.update(true, PLUS | MINUS), 1);
+    CHECK_EQ(c.update(true, 0), 0);
+    // 配置の分からないゲームパッドでは何もしない
+    CHECK_EQ(c.update(false, SELECT | START), 0);
+    CHECK_EQ(c.update(false, 0xffffffffu), 0);
+    // ゲームパッドごとに別に見る: 1 台目の Start と 2 台目の Select では何もしない
+    platform::PadResetCombo pads[2];
+    CHECK_EQ(pads[0].update(true, START), 0);
+    CHECK_EQ(pads[1].update(true, SELECT), 0);
+    // 両方を押したままつないだ: 最初のレポートではリセットせず、両方を離して押し直したら受ける
+    platform::PadResetCombo d;
+    CHECK_EQ(d.update(true, SELECT | START), 0);
+    CHECK_EQ(d.update(true, START), 0);
+    CHECK_EQ(d.update(true, SELECT | START), 0);
+    CHECK_EQ(d.update(true, 0), 0);
+    CHECK_EQ(d.update(true, SELECT | START), 1);
+    // reset() (つなぎ直した) のあとも同じ
+    CHECK_EQ(d.update(true, 0), 0);
+    d.reset();
+    CHECK_EQ(d.update(true, SELECT | START), 0);
+    CHECK_EQ(d.update(true, 0), 0);
+    CHECK_EQ(d.update(true, SELECT | START), 1);
+}
+
+void testPadMenuInput() {
+    printf("gamepad settings menu\n");
+    namespace mk = platform::menu_key;
+    typedef platform::PadMenuInput P;
+    const unsigned HOME = 1u << 0, SELECT = 1u << 11, MINUS = 1u << 20;
+    const uint8_t U = InputSink::JOY_UP, D = InputSink::JOY_DOWN, R = InputSink::JOY_RIGHT, A = InputSink::JOY_A,
+                  B = InputSink::JOY_B;
+    uint8_t out = 0, ev[P::MAX_EVENTS];
+    int n = 0;
+    P p;
+    p.reset();
+    // つないだあと最初のレポートで Home を押していれば開く (変わったときだけ送るゲームパッド)
+    CHECK_EQ(p.update(true, HOME, 0, false, out, ev, n), P::OPEN);
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.update(true, HOME, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(ev[0], mk::SCROLL_LOCK);
+    p.closed();
+    CHECK_EQ(p.update(true, 0, U | A, false, out, ev, n), P::PASS);
+    CHECK_EQ(out, U | A); // ふだんは X68000 に送る
+    CHECK_EQ(p.update(true, HOME, U | A, false, out, ev, n), P::OPEN);
+    // 開いている間: 新しく押した方向とボタンをメニューのキーにする (押していた上と A は出さない)
+    CHECK_EQ(p.update(true, HOME, U | A, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(out, 0);
+    CHECK_EQ(p.update(true, 0, D, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], mk::DOWN);
+    CHECK_EQ(p.holds(mk::DOWN), 1); // 押し続けたら繰り返す
+    CHECK_EQ(p.holds(mk::UP), 0);
+    CHECK_EQ(p.update(true, 0, D | R | A | B, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 3);
+    CHECK_EQ(ev[0], mk::RIGHT);
+    CHECK_EQ(ev[1], mk::ENTER);
+    CHECK_EQ(ev[2], mk::ESC);
+    // Select を押しながら上: 閉じる (Scroll Lock)。上は ↑ として渡さない
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.update(true, SELECT, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(p.update(true, SELECT, U | A, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], mk::SCROLL_LOCK);
+    // 閉じたときに押していた上と A は、離すまで X68000 に送らない
+    p.closed();
+    CHECK_EQ(p.update(true, SELECT, U | A | B, false, out, ev, n), P::PASS);
+    CHECK_EQ(out, B);
+    CHECK_EQ(p.update(true, 0, A | B, false, out, ev, n), P::PASS);
+    CHECK_EQ(out, B);
+    CHECK_EQ(p.update(true, 0, 0, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.update(true, 0, U | A, false, out, ev, n), P::PASS);
+    CHECK_EQ(out, U | A);
+    // 上を押してから Select (Switch Pro の -) を押しても開く
+    CHECK_EQ(p.update(true, MINUS, U, false, out, ev, n), P::OPEN);
+    CHECK_EQ(p.update(true, MINUS, U, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    // Home で閉じる
+    CHECK_EQ(p.update(true, HOME, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], mk::SCROLL_LOCK);
+    p.closed();
+    // 押したままの Home では開き直さない
+    CHECK_EQ(p.update(true, HOME, 0, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.update(true, 0, 0, false, out, ev, n), P::PASS);
+    // 配置の分からないゲームパッドでは開かないが、開いているメニューの中では操作できる
+    P q;
+    q.reset();
+    CHECK_EQ(q.update(false, 0, 0, false, out, ev, n), P::PASS);
+    CHECK_EQ(q.update(false, HOME | SELECT, U, false, out, ev, n), P::PASS);
+    CHECK_EQ(out, U);
+    CHECK_EQ(q.update(false, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(q.update(false, 1, A, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], mk::ENTER);
+}
+
+void testPadMenuStart() {
+    printf("gamepad Select + up with Start\n");
+    typedef platform::PadMenuInput P;
+    const unsigned SELECT = 1u << 11, START = 1u << 14;
+    const uint8_t U = InputSink::JOY_UP;
+    uint8_t out = 0, ev[P::MAX_EVENTS];
+    int n = 0;
+    P p;
+    p.reset();
+    platform::PadResetCombo c;
+    c.reset();
+    CHECK_EQ(c.update(true, 0), 0);
+    // 上と Start を押したまま Select を足す: リセットだけで、メニューは開かない
+    CHECK_EQ(p.update(true, START, U, false, out, ev, n), P::PASS);
+    CHECK_EQ(c.update(true, START), 0);
+    CHECK_EQ(p.update(true, START | SELECT, U, false, out, ev, n), P::PASS);
+    CHECK_EQ(c.update(true, START | SELECT), 1);
+    // Start を先に離しても、Select と上を離して押し直すまでは開かない
+    CHECK_EQ(p.update(true, SELECT, U, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.update(true, SELECT, 0, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.update(true, SELECT, U, false, out, ev, n), P::OPEN);
+    // メニューの中でも、Start を押しながらの Select + 上では閉じない
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.update(true, START | SELECT, U, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], platform::menu_key::UP);
+}
+
+void testPadPairInput() {
+    printf("two gamepads in one update\n");
+    namespace mk = platform::menu_key;
+    typedef platform::PadPairInput PP;
+    const unsigned HOME = 1u << 0, SELECT = 1u << 11, START = 1u << 14;
+    const uint8_t U = InputSink::JOY_UP, A = InputSink::JOY_A, B = InputSink::JOY_B;
+    PP pp;
+    PP::Pad in[2];
+    in[0].present = in[1].present = true;
+    pp.reset(0);
+    pp.reset(1);
+    PP::Result r = pp.update(in, false);
+    CHECK_EQ(r.reset || r.open, 0);
+    // 1 台目の Home で開く
+    in[0].buttons = HOME;
+    r = pp.update(in, false);
+    CHECK_EQ(r.open, 1);
+    CHECK_EQ(r.reset, 0);
+    in[0].buttons = 0;
+    r = pp.update(in, true);
+    // 同じ更新で、1 台目が閉じ (Home)、2 台目が Start + Select: リセットしない
+    in[0].buttons = HOME;
+    in[1].buttons = START | SELECT;
+    r = pp.update(in, true);
+    CHECK_EQ(r.reset, 0);
+    CHECK_EQ(r.open, 0);
+    CHECK_EQ(r.nEvents, 1);
+    CHECK_EQ(r.events[0], mk::SCROLL_LOCK);
+    // 閉じたあとも、押したままの Start + Select ではリセットしない (離して押し直せばする)
+    r = pp.update(in, false);
+    CHECK_EQ(r.reset, 0);
+    in[0].buttons = in[1].buttons = 0;
+    r = pp.update(in, false);
+    in[1].buttons = START | SELECT;
+    r = pp.update(in, false);
+    CHECK_EQ(r.reset, 1);
+    in[1].buttons = 0;
+    r = pp.update(in, false);
+    // メニューの中で押していた A は、閉じたあと離すまで送らない (キーボードで閉じたときも)
+    r = pp.update(in, false);
+    in[0].buttons = HOME;
+    r = pp.update(in, false);
+    CHECK_EQ(r.open, 1);
+    in[0].buttons = 0;
+    in[0].bits = A;
+    in[1].bits = B;
+    r = pp.update(in, true);
+    CHECK_EQ(r.nEvents, 2);
+    CHECK_EQ(r.events[0], mk::ENTER);
+    CHECK_EQ(r.events[1], mk::ESC);
+    CHECK_EQ(r.joy[0] | r.joy[1], 0);
+    r = pp.update(in, false); // メニューが閉じた
+    CHECK_EQ(r.joy[0] | r.joy[1], 0);
+    in[0].bits = 0;
+    in[1].bits = 0;
+    r = pp.update(in, false);
+    in[0].bits = A;
+    r = pp.update(in, false);
+    CHECK_EQ(r.joy[0], A);
+    in[0].bits = 0;
+    r = pp.update(in, false);
+    // 同じ更新で、1 台目が Start + Select、2 台目が Home: リセットだけ
+    in[0].buttons = START | SELECT;
+    in[1].buttons = HOME;
+    r = pp.update(in, false);
+    CHECK_EQ(r.reset, 1);
+    CHECK_EQ(r.open, 0);
+    in[0].buttons = in[1].buttons = 0;
+    r = pp.update(in, false);
+    // 上と Start を押したまま Select を足す: リセットだけ
+    in[0].buttons = START;
+    in[0].bits = U;
+    r = pp.update(in, false);
+    in[0].buttons = START | SELECT;
+    r = pp.update(in, false);
+    CHECK_EQ(r.reset, 1);
+    CHECK_EQ(r.open, 0);
+    CHECK_EQ(r.joy[0], U);
+}
+
+void testPadMenuHold() {
+    printf("gamepad menu repeat and Select + up again\n");
+    namespace mk = platform::menu_key;
+    typedef platform::PadMenuInput P;
+    const unsigned SELECT = 1u << 11;
+    const uint8_t U = InputSink::JOY_UP, L = InputSink::JOY_LEFT, R = InputSink::JOY_RIGHT;
+    uint8_t out = 0, ev[P::MAX_EVENTS];
+    int n = 0;
+    // メニューを開く前から押していた左は、繰り返さない (もう 1 台のパッドで押したままのとき)
+    P p;
+    p.reset();
+    CHECK_EQ(p.update(true, 0, L, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.update(true, 0, L, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(p.holds(mk::LEFT), 0);
+    // メニューの中で押した右と上は繰り返す。離したらやめる
+    CHECK_EQ(p.update(true, 0, L | R, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.holds(mk::RIGHT), 1);
+    CHECK_EQ(p.holds(mk::LEFT), 0);
+    CHECK_EQ(p.update(true, 0, U, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.holds(mk::UP), 1);
+    CHECK_EQ(p.holds(mk::RIGHT), 0);
+    // 左を離して押し直せば、繰り返す
+    CHECK_EQ(p.update(true, 0, U | L, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.holds(mk::LEFT), 1);
+    CHECK_EQ(p.holds(mk::UP), 1);
+    // メニューの外では繰り返さない
+    CHECK_EQ(p.update(true, 0, U | L, false, out, ev, n), P::PASS);
+    CHECK_EQ(p.holds(mk::UP) || p.holds(mk::LEFT), 0);
+    // メニューの中で押した右を押したまま、キーボードでメニューを閉じて開き直した (パッドの次のレポートより前): 右は繰り返さない
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.update(true, 0, R, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.holds(mk::RIGHT), 1);
+    p.closed();
+    CHECK_EQ(p.holds(mk::RIGHT), 0);
+    // X68000 を動かす前 (メニューを開いていることにして呼ぶ) に押した方向も、forgetHeld() で繰り返さない
+    CHECK_EQ(p.update(true, 0, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(p.update(true, 0, U, true, out, ev, n), P::MENU);
+    p.forgetHeld();
+    CHECK_EQ(p.holds(mk::UP), 0);
+    // Select を押したまま上を押し直すと、閉じて開き直せる
+    P q;
+    q.reset();
+    CHECK_EQ(q.update(true, SELECT, U, false, out, ev, n), P::OPEN);
+    CHECK_EQ(q.update(true, SELECT, 0, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 0);
+    CHECK_EQ(q.update(true, SELECT, U, true, out, ev, n), P::MENU);
+    CHECK_EQ(n, 1);
+    CHECK_EQ(ev[0], mk::SCROLL_LOCK);
+    q.closed();
+    CHECK_EQ(q.update(true, SELECT, 0, false, out, ev, n), P::PASS);
+    CHECK_EQ(q.update(true, SELECT, U, false, out, ev, n), P::OPEN);
+}
+
+void testPadLayout() {
+    printf("gamepad layout by VID:PID\n");
+    CHECK_EQ(platform::findPadLayout(0x0f0d, 0x0000) == nullptr, 1);
+    CHECK_EQ(platform::findPadLayout(0x1234, 0x00c1) == nullptr, 1);
+    const platform::PadLayout* h = platform::findPadLayout(0x0f0d, 0x00c1); // HORIPAD S
+    CHECK_EQ(h != nullptr, 1);
+    if (h == nullptr) return;
+    // Y、B、A、X、L、R、ZL、ZR、-、+、左スティック、右スティック、Home、Capture
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 0), 1u << 7);  // Y
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 1), 1u << 8);  // B
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 2), 1u << 9);  // A
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 3), 1u << 10); // X
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 8), 1u << 20); // -
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 9), 1u << 19); // +
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 12), 1u << 0); // Home
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 13), 1u << 11); // Capture (Select)
+    CHECK_EQ(platform::remapPadButtons(*h, 1u << 14), 0u);      // 表にないボタン
+    // 並べ直したあとは、配置の分かるゲームパッドと同じ: A / X はトリガ A、B / Y はトリガ B
+    platform::GamePadInput in;
+    in.known = true;
+    in.buttons = platform::remapPadButtons(*h, (1u << 2) | (1u << 1));
+    CHECK_EQ(platform::joystickBits(in), InputSink::JOY_A | InputSink::JOY_B);
+    // + と - でリセット、Home でメニュー
+    platform::PadResetCombo c;
+    CHECK_EQ(c.update(true, 0), 0);
+    CHECK_EQ(c.update(true, platform::remapPadButtons(*h, (1u << 8) | (1u << 9))), 1);
+    platform::PadMenuInput m;
+    uint8_t out = 0, ev[platform::PadMenuInput::MAX_EVENTS];
+    int n = 0;
+    CHECK_EQ(m.update(true, platform::remapPadButtons(*h, 1u << 12), 0, false, out, ev, n), platform::PadMenuInput::OPEN);
+}
+
 } // namespace
 
 int main() {
@@ -357,5 +674,11 @@ int main() {
     testHatDecoder();
     testLedSender();
     testGamePad();
+    testPadResetCombo();
+    testPadMenuInput();
+    testPadMenuStart();
+    testPadPairInput();
+    testPadMenuHold();
+    testPadLayout();
     return finish();
 }

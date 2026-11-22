@@ -101,9 +101,14 @@ public:
     uint8_t spriteRead(uint32_t offset) const { return sprite_[offset & (SPRITE_SIZE - 1)]; }
     void spriteWrite(uint32_t offset, uint8_t v) {
         if (journal_) journal_->push(VideoJournal::make(VideoJournal::OP_SPRITE, offset, v));
-        sprite_[offset & (SPRITE_SIZE - 1)] = v;
+        const uint32_t at = offset & (SPRITE_SIZE - 1);
+        // Only Y and priority affect which scanlines can contain a sprite.
+        if (at < 0x400 && ((at & 7) == 2 || (at & 7) == 3 || (at & 7) == 7) && sprite_[at] != v)
+            spriteRowsWrites_++;
+        sprite_[at] = v;
     }
     const uint8_t* sprite() const { return sprite_; }
+    uint32_t spriteRowsGeneration() const { return spriteRowsWrites_; }
 
     // ---- 表示タイミング ----
     // 1 ラスタの長さは「水平のドット数 (R00 + 1) x 8」/ ドットクロック。1 フレームは R04 + 1 ラスタ
@@ -150,6 +155,7 @@ private:
     VideoJournal* journal_ = nullptr;
     uint16_t crtc_[24] = {};
     uint32_t crtcWrites_ = 0;
+    uint32_t spriteRowsWrites_ = 0; // Derived renderer cache generation; not serialized.
     uint8_t operation_ = 0;
     bool fastClearRequested_ = false; // 高速クリアを要求された (次の垂直表示期間の始まりで消す)
     int fastClearFields_ = 0;         // 消し始めてから終わるまでの、残りの垂直表示期間の数
